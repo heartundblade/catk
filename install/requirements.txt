@@ -11,6 +11,7 @@ opencv-python-headless==4.10.0.84 # MIT License: https://github.com/opencv/openc
 
 # for waymo dataset
 tensorboard==2.12.3 # Apache License 2.0: https://github.com/tensorflow/tensorboard/blob/master/LICENSE
+# tensorflow==2.12.0 # Apache License 2.0: https://github.com/tensorflow/tensorflow/blob/master/LICENSE
 tensorflow-cpu==2.12.0 # Apache License 2.0: https://github.com/tensorflow/tensorflow/blob/master/LICENSE
 tensorflow-estimator==2.12.0 # Apache License 2.0: https://github.com/tensorflow/estimator/blob/master/LICENSE
 tensorflow-io-gcs-filesystem==0.37.0 # Apache License 2.0: https://github.com/tensorflow/io/blob/master/LICENSE
