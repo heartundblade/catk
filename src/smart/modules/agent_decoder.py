@@ -432,7 +432,7 @@ class SMARTAgentDecoder(nn.Module):
 
         # ! final mlp to get outputs
         next_token_logits = self.token_predict_head(feat_a)
-
+        
         return {
             # action that goes from [(10->15), ..., (85->90)]
             "next_token_logits": next_token_logits[:, 1:-1],  # [n_agent, 16, n_token]
@@ -671,7 +671,7 @@ class SMARTAgentDecoder(nn.Module):
             head_a_next = torch.arctan2(diff_xy_next[:, 1], diff_xy_next[:, 0])
             pred_idx[:, n_step] = next_token_idx
 
-            # ! update tensors for for next step
+            # ! update tensors for next step
             pred_valid[:, n_step] = pred_valid[:, t_now]
             # pred_valid[:, n_step] = pred_valid[:, t_now] | mask_spawn
             pos_a = torch.cat([pos_a, pos_a_next.unsqueeze(1)], dim=1)

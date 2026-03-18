@@ -22,6 +22,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from src.smart.metrics import (
     CrossEntropy,
     TokenCls,
+    TrajectoryRecorder,
     WOSACMetrics,
     WOSACSubmission,
     minADE,
@@ -57,6 +58,7 @@ class SMART(LightningModule):
         self.TokenCls = TokenCls(max_guesses=5)
         self.wosac_metrics = WOSACMetrics("val_closed")
         self.wosac_submission = WOSACSubmission(**model_config.wosac_submission)
+        self.trajectory_recorder = TrajectoryRecorder(**model_config.trajectory_recorder)
         self.training_loss = CrossEntropy(**model_config.training_loss)
 
         self.n_rollout_closed_val = model_config.n_rollout_closed_val
@@ -135,9 +137,49 @@ class SMART(LightningModule):
             pred_traj = torch.stack(pred_traj, dim=1)  # [n_ag, n_rollout, n_step, 2]
             pred_z = torch.stack(pred_z, dim=1)  # [n_ag, n_rollout, n_step]
             pred_head = torch.stack(pred_head, dim=1)  # [n_ag, n_rollout, n_step]
+            
+            # Record trajectories
+            if self.trajectory_recorder.is_active:
+                self.trajectory_recorder.update(
+                    scenario_id=data["scenario_id"],
+                    agent_id=data["agent"]["id"],
+                    pred_traj=pred_traj,
+                    pred_z=pred_z,
+                    pred_head=pred_head,
+                    gt_traj=data["agent"]["position"][:, self.num_historical_steps :, : pred_traj.shape[-1]],
+                    gt_valid=data["agent"]["valid_mask"][:, self.num_historical_steps :],
+                )
 
             # ! WOSAC
             scenario_rollouts = None
+            
+            # Always compute metrics regardless of wosac_submission status
+            self.minADE.update(
+                pred=pred_traj,
+                target=data["agent"]["position"][
+                    :, self.num_historical_steps :, : pred_traj.shape[-1]
+                ],
+                target_valid=data["agent"]["valid_mask"][
+                    :, self.num_historical_steps :
+                ],
+            )
+
+            # WOSAC metrics
+            if batch_idx < self.n_batch_wosac_metric:
+                device = pred_traj.device
+                scenario_rollouts = get_scenario_rollouts(
+                    scenario_id=get_scenario_id_int_tensor(
+                        data["scenario_id"], device
+                    ),
+                    agent_id=data["agent"]["id"],
+                    agent_batch=data["agent"]["batch"],
+                    pred_traj=pred_traj,
+                    pred_z=pred_z,
+                    pred_head=pred_head,
+                )
+                self.wosac_metrics.update(data["tfrecord_path"], scenario_rollouts)
+            
+            # Save WOSAC submission if active
             if self.wosac_submission.is_active:  # ! save WOSAC submission
                 self.wosac_submission.update(
                     scenario_id=data["scenario_id"],
@@ -153,35 +195,11 @@ class SMART(LightningModule):
                     for k in _gpu_dict_sync.keys():  # single gpu fix
                         if type(_gpu_dict_sync[k]) is list:
                             _gpu_dict_sync[k] = _gpu_dict_sync[k][0]
-                    scenario_rollouts = get_scenario_rollouts(**_gpu_dict_sync)
+                    # Reuse existing scenario_rollouts if available, otherwise create new
+                    if scenario_rollouts is None:
+                        scenario_rollouts = get_scenario_rollouts(**_gpu_dict_sync)
                     self.wosac_submission.aggregate_rollouts(scenario_rollouts)
                 self.wosac_submission.reset()
-
-            else:  # ! compute metrics, disable if save WOSAC submission
-                self.minADE.update(
-                    pred=pred_traj,
-                    target=data["agent"]["position"][
-                        :, self.num_historical_steps :, : pred_traj.shape[-1]
-                    ],
-                    target_valid=data["agent"]["valid_mask"][
-                        :, self.num_historical_steps :
-                    ],
-                )
-
-                # WOSAC metrics
-                if batch_idx < self.n_batch_wosac_metric:
-                    device = pred_traj.device
-                    scenario_rollouts = get_scenario_rollouts(
-                        scenario_id=get_scenario_id_int_tensor(
-                            data["scenario_id"], device
-                        ),
-                        agent_id=data["agent"]["id"],
-                        agent_batch=data["agent"]["batch"],
-                        pred_traj=pred_traj,
-                        pred_z=pred_z,
-                        pred_head=pred_head,
-                    )
-                    self.wosac_metrics.update(data["tfrecord_path"], scenario_rollouts)
 
             # ! visualization
             if self.global_rank == 0 and batch_idx < self.n_vis_batch:
@@ -202,21 +220,24 @@ class SMART(LightningModule):
 
     def on_validation_epoch_end(self):
         if self.val_closed_loop:
-            if not self.wosac_submission.is_active:
-                epoch_wosac_metrics = self.wosac_metrics.compute()
-                epoch_wosac_metrics["val_closed/ADE"] = self.minADE.compute()
-                if self.global_rank == 0:
-                    epoch_wosac_metrics["epoch"] = (
-                        self.log_epoch if self.log_epoch >= 0 else self.current_epoch
-                    )
-                    self.logger.log_metrics(epoch_wosac_metrics)
+            # Always compute and log metrics regardless of wosac_submission status
+            epoch_wosac_metrics = self.wosac_metrics.compute()
+            epoch_wosac_metrics["val_closed/ADE"] = self.minADE.compute()
+            if self.global_rank == 0:
+                epoch_wosac_metrics["epoch"] = (
+                    self.log_epoch if self.log_epoch >= 0 else self.current_epoch
+                )
+                self.logger.log_metrics(epoch_wosac_metrics)
 
-                self.wosac_metrics.reset()
-                self.minADE.reset()
+            self.wosac_metrics.reset()
+            self.minADE.reset()
 
             if self.global_rank == 0:
                 if self.wosac_submission.is_active:
                     self.wosac_submission.save_sub_file()
+                # Save trajectories at the end of validation epoch
+                if self.trajectory_recorder.is_active:
+                    self.trajectory_recorder.on_epoch_end()
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
@@ -259,6 +280,18 @@ class SMART(LightningModule):
         pred_traj = torch.stack(pred_traj, dim=1)  # [n_ag, n_rollout, n_step, 2]
         pred_z = torch.stack(pred_z, dim=1)  # [n_ag, n_rollout, n_step]
         pred_head = torch.stack(pred_head, dim=1)  # [n_ag, n_rollout, n_step]
+        
+        # Record trajectories
+        if self.trajectory_recorder.is_active:
+            self.trajectory_recorder.update(
+                scenario_id=data["scenario_id"],
+                agent_id=data["agent"]["id"],
+                pred_traj=pred_traj,
+                pred_z=pred_z,
+                pred_head=pred_head,
+                gt_traj=data["agent"]["position"][:, self.num_historical_steps :, : pred_traj.shape[-1]] if "position" in data["agent"] else None,
+                gt_valid=data["agent"]["valid_mask"][:, self.num_historical_steps :] if "valid_mask" in data["agent"] else None,
+            )
 
         # ! WOSAC submission save
         self.wosac_submission.update(
@@ -282,3 +315,7 @@ class SMART(LightningModule):
     def on_test_epoch_end(self):
         if self.global_rank == 0:
             self.wosac_submission.save_sub_file()
+            
+            # Save trajectories at the end of test epoch
+            if self.trajectory_recorder.is_active:
+                self.trajectory_recorder.on_epoch_end()

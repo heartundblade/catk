@@ -57,3 +57,10 @@ model_config:
     label_smoothing: 0.1
     rollout_as_gt: false
   finetune: false
+  
+  # Trajectory recorder configuration
+  trajectory_recorder:
+    is_active: true  # Set to true to enable trajectory recording
+    save_format: "json"  # Format to save trajectories (json)
+    save_interval: 100  # Save every 100 scenarios
+    save_dir: null  # If null, saves to output_dir/trajectories

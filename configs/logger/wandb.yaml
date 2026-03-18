@@ -4,13 +4,15 @@ wandb:
   _target_: lightning.pytorch.loggers.wandb.WandbLogger
   name: ${task_name}
   save_dir: "${paths.output_dir}"
-  offline: False
+  # offline: False
+  offline: True
   id: null # pass correct id to resume experiment!
   anonymous: null # enable anonymous logging
   project: clsft-catk
   log_model: False # upload lightning ckpts
   prefix: "" # a string to put at the beginning of metric keys
-  entity: YOUR_ENTITY
+  # entity: YOUR_ENTITY
+  entity: heartundb1ade-tsinghua-university
   group: ""
   tags: []
   job_type: ""
