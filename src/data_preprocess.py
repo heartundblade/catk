@@ -445,6 +445,43 @@ def wm2argo(file_path, split, output_dir, output_dir_tfrecords_splitted):
     dataset = tf.data.TFRecordDataset(
         file_path, compression_type="", num_parallel_reads=3
     )
+
+    # dataset_list = list(dataset.as_numpy_iterator())
+    # if dataset_list:  # 避免空数据集
+    #     last_tf_data = dataset_list[-1]
+
+    #     scenario = scenario_pb2.Scenario()
+    #     scenario.ParseFromString(bytes(last_tf_data))
+
+    #     track_infos = decode_tracks_from_proto(scenario)
+    #     map_infos = decode_map_features_from_proto(scenario.map_features)
+    #     dynamic_map_infos = decode_dynamic_map_states_from_proto(
+    #         scenario.dynamic_map_states
+    #     )
+
+    #     current_time_index = scenario.current_time_index
+    #     scenario_id = scenario.scenario_id
+    #     tf_lights = process_dynamic_map(dynamic_map_infos)
+    #     tf_current_light = tf_lights.loc[tf_lights["time_step"] == current_time_index]
+    #     map_data = get_map_features(map_infos, tf_current_light)
+
+    #     data = preprocess_map(map_data)
+    #     data["agent"] = get_agent_features(
+    #         track_infos,
+    #         split=split,
+    #         num_historical_steps=current_time_index + 1,
+    #         num_steps=91,
+    #     )
+
+    #     data["scenario_id"] = scenario_id
+    #     with open(output_dir / f"{scenario_id}.pkl", "wb+") as f:
+    #         pickle.dump(data, f)
+
+    #     if output_dir_tfrecords_splitted is not None:
+    #         file_name = output_dir_tfrecords_splitted / f"{scenario_id}.tfrecords"
+    #         with tf.io.TFRecordWriter(file_name.as_posix()) as file_writer:
+    #             file_writer.write(last_tf_data)
+
     for tf_data in dataset:
         tf_data = tf_data.numpy()
         scenario = scenario_pb2.Scenario()
@@ -491,6 +528,14 @@ def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
 
     input_dir = Path(input_dir) / split
     packages = sorted([p.as_posix() for p in input_dir.glob("*")])
+
+    # # 处理部分特定tfrecord文件
+    # packages = packages[:77] if packages else []
+    # # packages = [packages[-1]] if packages else []
+    # if not packages:
+    #     print(f"警告：{input_dir} 下无任何文件可处理")
+    #     return
+
     func = partial(
         wm2argo,
         split=split,
@@ -499,6 +544,7 @@ def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
     )
 
     with multiprocessing.Pool(num_workers) as p:
+        # print('111',input_dir)
         r = list(tqdm(p.imap_unordered(func, packages), total=len(packages)))
 
 

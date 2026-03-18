@@ -26,17 +26,18 @@ model:
       rollout_as_gt: false
     finetune: true
 
-ckpt_path: BC_PRETRAINED_MODEL.ckpt
+ckpt_path: ${paths.log_dir}/pre_bc-debug/runs/2026-03-17_13-44-53/checkpoints/epoch_031.ckpt
 
 trainer:
   limit_train_batches: 1.0
-  limit_val_batches: 50
+  limit_val_batches: 20
   check_val_every_n_epoch: 1
+  max_epochs: 32
 
 data:
-  train_batch_size: 10
-  val_batch_size: 10
-  test_batch_size: 10
-  num_workers: 10
+  train_batch_size: 20
+  val_batch_size: 20
+  test_batch_size: 20
+  num_workers: 20
 
 action: finetune

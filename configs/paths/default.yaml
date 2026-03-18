@@ -13,4 +13,5 @@ log_dir: ${paths.root_dir}/logs/
 output_dir: ${hydra:runtime.output_dir}
 
 # path to data directory
-cache_root: /scratch/cache/SMART
+# cache_root: /scratch/cache/SMART
+cache_root: /inspire/hdd/project/fengsiyuan/maoyingming-253208110273/zhl/dataset/womd
