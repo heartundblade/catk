@@ -56,6 +56,7 @@ class TrajectoryRecorder(Metric):
                 "pred_head",
                 "gt_traj",
                 "gt_valid",
+                "wosac_metrics",
             ]
             for k in self.data_keys:
                 self.add_state(k, default=[], dist_reduce_fx="cat")
@@ -72,6 +73,7 @@ class TrajectoryRecorder(Metric):
         pred_head: Tensor,   # [n_ag, n_rollout, n_step]
         gt_traj: Optional[Tensor] = None,  # [n_ag, n_step, 2]
         gt_valid: Optional[Tensor] = None, # [n_ag, n_step]
+        wosac_metrics: Optional[Dict[str, Tensor]] = None,  # Pre-computed WOSAC metrics
     ) -> None:
         if not self.is_active:
             return
@@ -88,6 +90,10 @@ class TrajectoryRecorder(Metric):
         if gt_valid is not None:
             self.gt_valid.append(gt_valid.cpu())
         
+        # Store pre-computed WOSAC metrics
+        if wosac_metrics is not None:
+            self.wosac_metrics.append(wosac_metrics)
+        
         self.buffer_count += len(scenario_id)
         
         # Save if buffer reaches interval
@@ -99,11 +105,24 @@ class TrajectoryRecorder(Metric):
             return
         
         trajectories = []
+        
+        # Process trajectory data
         for i in range(len(self.scenario_id)):
             scenario_data = {
                 "scenario_id": self.scenario_id[i],
-                "agents": []
+                "agents": [],
+                "wosac_metrics": {}
             }
+            
+            # Add pre-computed WOSAC metrics for this scenario if available
+            if hasattr(self, 'wosac_metrics') and len(self.wosac_metrics) > i and self.wosac_metrics[i] is not None:
+                scenario_metrics = {}
+                for key, value in self.wosac_metrics[i].items():
+                    if isinstance(value, torch.Tensor):
+                        scenario_metrics[key] = value.item()
+                    else:
+                        scenario_metrics[key] = value
+                scenario_data["wosac_metrics"] = scenario_metrics
             
             n_agents = len(self.agent_id[i])
             for j in range(n_agents):
@@ -138,7 +157,7 @@ class TrajectoryRecorder(Metric):
             output_file = self.save_dir / f"trajectories_{self.file_index:05d}.json"
             with open(output_file, 'w') as f:
                 json.dump(trajectories, f, indent=2)
-            log.info(f"Saved trajectories to {output_file}")
+            log.info(f"Saved trajectories with WOSAC metrics to {output_file}")
         
         # Reset buffer
         for k in self.data_keys:

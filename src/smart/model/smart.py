@@ -140,6 +140,15 @@ class SMART(LightningModule):
             
             # Record trajectories
             if self.trajectory_recorder.is_active:
+                # Get current WOSAC metrics if available
+                current_wosac_metrics = None
+                if hasattr(self, 'wosac_metrics'):
+                    try:
+                        # Compute current metrics for this batch
+                        current_wosac_metrics = self.wosac_metrics.compute()
+                    except Exception as e:
+                        pass
+                
                 self.trajectory_recorder.update(
                     scenario_id=data["scenario_id"],
                     agent_id=data["agent"]["id"],
@@ -148,6 +157,7 @@ class SMART(LightningModule):
                     pred_head=pred_head,
                     gt_traj=data["agent"]["position"][:, self.num_historical_steps :, : pred_traj.shape[-1]],
                     gt_valid=data["agent"]["valid_mask"][:, self.num_historical_steps :],
+                    wosac_metrics=current_wosac_metrics,
                 )
 
             # ! WOSAC
@@ -202,21 +212,21 @@ class SMART(LightningModule):
                 self.wosac_submission.reset()
 
             # ! visualization
-            if self.global_rank == 0 and batch_idx < self.n_vis_batch:
-                if scenario_rollouts is not None:
-                    for _i_sc in range(self.n_vis_scenario):
-                        _vis = VisWaymo(
-                            scenario_path=data["tfrecord_path"][_i_sc],
-                            save_dir=self.video_dir
-                            / f"batch_{batch_idx:02d}-scenario_{_i_sc:02d}",
-                        )
-                        _vis.save_video_scenario_rollout(
-                            scenario_rollouts[_i_sc], self.n_vis_rollout
-                        )
-                        for _path in _vis.video_paths:
-                            self.logger.log_video(
-                                "/".join(_path.split("/")[-3:]), [_path]
-                            )
+            # if self.global_rank == 0 and batch_idx < self.n_vis_batch:
+            #     if scenario_rollouts is not None:
+            #         for _i_sc in range(self.n_vis_scenario):
+            #             _vis = VisWaymo(
+            #                 scenario_path=data["tfrecord_path"][_i_sc],
+            #                 save_dir=self.video_dir
+            #                 / f"batch_{batch_idx:02d}-scenario_{_i_sc:02d}",
+            #             )
+            #             _vis.save_video_scenario_rollout(
+            #                 scenario_rollouts[_i_sc], self.n_vis_rollout
+            #             )
+            #             for _path in _vis.video_paths:
+            #                 self.logger.log_video(
+            #                     "/".join(_path.split("/")[-3:]), [_path]
+            #                 )
 
     def on_validation_epoch_end(self):
         if self.val_closed_loop:
@@ -283,6 +293,15 @@ class SMART(LightningModule):
         
         # Record trajectories
         if self.trajectory_recorder.is_active:
+            # Get current WOSAC metrics if available
+            current_wosac_metrics = None
+            if hasattr(self, 'wosac_metrics'):
+                try:
+                    # Compute current metrics for this batch
+                    current_wosac_metrics = self.wosac_metrics.compute()
+                except Exception as e:
+                    pass
+            
             self.trajectory_recorder.update(
                 scenario_id=data["scenario_id"],
                 agent_id=data["agent"]["id"],
@@ -291,6 +310,7 @@ class SMART(LightningModule):
                 pred_head=pred_head,
                 gt_traj=data["agent"]["position"][:, self.num_historical_steps :, : pred_traj.shape[-1]] if "position" in data["agent"] else None,
                 gt_valid=data["agent"]["valid_mask"][:, self.num_historical_steps :] if "valid_mask" in data["agent"] else None,
+                wosac_metrics=current_wosac_metrics,
             )
 
         # ! WOSAC submission save
