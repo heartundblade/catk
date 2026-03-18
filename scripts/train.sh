@@ -4,15 +4,18 @@ export HYDRA_FULL_ERROR=1
 export TF_CPP_MIN_LOG_LEVEL=2
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-MY_EXPERIMENT="pre_bc"
+MY_EXPERIMENT="local_val"
 MY_TASK_NAME=$MY_EXPERIMENT"-debug"
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate catk
-torchrun \
-  -m src.run \
-  experiment=$MY_EXPERIMENT \
-  task_name=$MY_TASK_NAME
+# source ~/miniconda3/etc/profile.d/conda.sh
+# conda activate catk
+
+# torchrun \
+#   -m src.run \
+#   experiment=$MY_EXPERIMENT \
+#   task_name=$MY_TASK_NAME \
+#   trainer.limit_val_batches=5 \
+#   trainer.limit_train_batches=5
 
 # ! below is for training with ddp
 # torchrun \
@@ -25,5 +28,18 @@ torchrun \
 #   experiment=$MY_EXPERIMENT \
 #   trainer=ddp \
 #   task_name=$MY_TASK_NAME
+
+torchrun \
+  --rdzv_id 12345 \
+  --rdzv_backend c10d \
+  --rdzv_endpoint localhost:29500 \
+  --nnodes 1 \
+  --nproc_per_node 8 \
+  -m src.run \
+  experiment=$MY_EXPERIMENT \
+  trainer=ddp \
+  task_name=$MY_TASK_NAME # \
+  # trainer.limit_val_batches=5 \
+  # trainer.limit_train_batches=5
 
 echo "bash train.sh done!"

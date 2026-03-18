@@ -5,11 +5,12 @@ model_config:
   lr_total_steps: ${trainer.max_epochs}
   lr_min_ratio: 0.05
   n_rollout_closed_val: 32
-  n_batch_wosac_metric: 10
+  n_batch_wosac_metric: 20
   n_vis_batch: 2
-  n_vis_scenario: 5
+  n_vis_scenario: 4
   n_vis_rollout: 5
   val_open_loop: true
+  # val_closed_loop: true
   val_closed_loop: true
   token_processor:
     map_token_file: "map_traj_token5.pkl"

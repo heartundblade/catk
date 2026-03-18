@@ -50,21 +50,19 @@ class WaymoTargetBuilderTrain(BaseTransform):
     #     return HeteroData(data)
     
     def forward(self, data):
+        # ... (你原本的逻辑) ...
         pos = data["agent"]["position"]
         av_index = torch.where(data["agent"]["role"][:, 0])[0].item()
         distance = torch.norm(pos - pos[av_index], dim=-1)
 
-        # we do not believe the perception out of range of 150 meters
         data["agent"]["valid_mask"] = data["agent"]["valid_mask"] & (distance < 150)
-
-        # we do not predict vehicle too far away from ego car
         role_train_mask = data["agent"]["role"].any(-1)
         extra_train_mask = (distance[:, self.step_current] < 100) & (
             data["agent"]["valid_mask"][:, self.step_current + 1 :].sum(-1) >= 5
         )
 
         train_mask = extra_train_mask | role_train_mask
-        if train_mask.sum() > self.max_num:  # too many vehicle
+        if train_mask.sum() > self.max_num:
             _indices = torch.where(extra_train_mask & ~role_train_mask)[0]
             selected_indices = _indices[
                 torch.randperm(_indices.size(0))[: self.max_num - role_train_mask.sum()]
@@ -72,8 +70,7 @@ class WaymoTargetBuilderTrain(BaseTransform):
             data["agent"]["train_mask"] = role_train_mask
             data["agent"]["train_mask"][selected_indices] = True
         else:
-            data["agent"]["train_mask"] = train_mask  # [n_agent]
-
+            data["agent"]["train_mask"] = train_mask
         return HeteroData(data)
 
     def __call__(self, data) -> HeteroData:
@@ -86,7 +83,7 @@ class WaymoTargetBuilderVal(BaseTransform):
 
     # def __call__(self, data) -> HeteroData:
     #     return HeteroData(data)
-
+    
     def forward(self, data):
         return HeteroData(data)
     
