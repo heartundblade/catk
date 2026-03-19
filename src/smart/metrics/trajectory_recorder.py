@@ -169,3 +169,8 @@ class TrajectoryRecorder(Metric):
         # Save any remaining trajectories at the end of epoch
         if self.is_active and self.buffer_count > 0:
             self.save_trajectories()
+
+    def compute(self) -> Dict[str, Tensor]:
+        # Implement required abstract method
+        # Return empty dict as we don't need to compute metrics
+        return {}
