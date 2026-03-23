@@ -13,16 +13,35 @@
 
 import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 import hydra
 import torch
 from torch import Tensor
 from torchmetrics.metric import Metric
+from waymo_open_dataset.protos import sim_agents_submission_pb2
 
 from src.utils import RankedLogger
 
 log = RankedLogger(__name__, rank_zero_only=False)
+
+
+def convert_tensor_to_native(obj: Any) -> Any:
+    """
+    Recursively convert Tensor objects to native Python types
+    Reference: src/utils/wosac_utils.py
+    """
+    if isinstance(obj, torch.Tensor):
+        # Convert tensor to numpy array first, then to native Python type
+        return obj.cpu().numpy().tolist()
+    elif isinstance(obj, dict):
+        return {k: convert_tensor_to_native(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_tensor_to_native(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(convert_tensor_to_native(item) for item in obj)
+    else:
+        return obj
 
 
 class TrajectoryRecorder(Metric):
@@ -67,7 +86,7 @@ class TrajectoryRecorder(Metric):
     def update(
         self,
         scenario_id: List[str],
-        agent_id: List[List[float]],
+        agent_id: Tensor,
         pred_traj: Tensor,  # [n_ag, n_rollout, n_step, 2]
         pred_z: Tensor,      # [n_ag, n_rollout, n_step]
         pred_head: Tensor,   # [n_ag, n_rollout, n_step]
@@ -78,9 +97,19 @@ class TrajectoryRecorder(Metric):
         if not self.is_active:
             return
         
-        # Store data
+        # Store data - convert to CPU first as in wosac_utils.py
         self.scenario_id.append(scenario_id)
-        self.agent_id.append(agent_id)
+        
+        # Convert agent_id to native types if it's a tensor
+        converted_agent_id = []
+        for agent in agent_id:
+            if isinstance(agent, torch.Tensor):
+                converted_agent = agent.cpu().numpy().tolist()
+            else:
+                converted_agent = agent
+            converted_agent_id.append(converted_agent)
+        self.agent_id.append(converted_agent_id)
+        
         self.pred_traj.append(pred_traj.cpu())
         self.pred_z.append(pred_z.cpu())
         self.pred_head.append(pred_head.cpu())
@@ -92,7 +121,9 @@ class TrajectoryRecorder(Metric):
         
         # Store pre-computed WOSAC metrics
         if wosac_metrics is not None:
-            self.wosac_metrics.append(wosac_metrics)
+            # Convert metrics tensors to native types immediately
+            converted_metrics = convert_tensor_to_native(wosac_metrics)
+            self.wosac_metrics.append(converted_metrics)
         
         self.buffer_count += len(scenario_id)
         
@@ -116,13 +147,7 @@ class TrajectoryRecorder(Metric):
             
             # Add pre-computed WOSAC metrics for this scenario if available
             if hasattr(self, 'wosac_metrics') and len(self.wosac_metrics) > i and self.wosac_metrics[i] is not None:
-                scenario_metrics = {}
-                for key, value in self.wosac_metrics[i].items():
-                    if isinstance(value, torch.Tensor):
-                        scenario_metrics[key] = value.item()
-                    else:
-                        scenario_metrics[key] = value
-                scenario_data["wosac_metrics"] = scenario_metrics
+                scenario_data["wosac_metrics"] = self.wosac_metrics[i]
             
             n_agents = len(self.agent_id[i])
             for j in range(n_agents):
@@ -134,18 +159,19 @@ class TrajectoryRecorder(Metric):
                 # Process each rollout
                 n_rollouts = self.pred_traj[i].shape[1]
                 for k in range(n_rollouts):
+                    # Convert tensors to native types as in wosac_utils.py
                     rollout_data = {
-                        "trajectory": self.pred_traj[i][j, k].tolist(),
-                        "z": self.pred_z[i][j, k].tolist(),
-                        "head": self.pred_head[i][j, k].tolist()
+                        "trajectory": self.pred_traj[i][j, k].numpy().tolist(),
+                        "z": self.pred_z[i][j, k].numpy().tolist(),
+                        "head": self.pred_head[i][j, k].numpy().tolist()
                     }
                     agent_data["predictions"].append(rollout_data)
                 
                 # Add ground truth if available
                 if hasattr(self, 'gt_traj') and len(self.gt_traj) > i:
                     agent_data["ground_truth"] = {
-                        "trajectory": self.gt_traj[i][j].tolist(),
-                        "valid": self.gt_valid[i][j].tolist() if hasattr(self, 'gt_valid') and len(self.gt_valid) > i else None
+                        "trajectory": self.gt_traj[i][j].numpy().tolist(),
+                        "valid": self.gt_valid[i][j].numpy().tolist() if hasattr(self, 'gt_valid') and len(self.gt_valid) > i else None
                     }
                 
                 scenario_data["agents"].append(agent_data)
@@ -155,9 +181,18 @@ class TrajectoryRecorder(Metric):
         # Save to file
         if self.save_format == "json":
             output_file = self.save_dir / f"trajectories_{self.file_index:05d}.json"
-            with open(output_file, 'w') as f:
-                json.dump(trajectories, f, indent=2)
-            log.info(f"Saved trajectories with WOSAC metrics to {output_file}")
+            try:
+                with open(output_file, 'w') as f:
+                    json.dump(trajectories, f, indent=2)
+                log.info(f"Saved trajectories with WOSAC metrics to {output_file}")
+            except Exception as e:
+                log.error(f"Error saving trajectories: {e}")
+                # Try to save with a more robust approach
+                import pickle
+                pickle_file = self.save_dir / f"trajectories_{self.file_index:05d}.pkl"
+                with open(pickle_file, 'wb') as f:
+                    pickle.dump(trajectories, f)
+                log.info(f"Saved trajectories with WOSAC metrics to {pickle_file} using pickle")
         
         # Reset buffer
         for k in self.data_keys:
@@ -169,7 +204,7 @@ class TrajectoryRecorder(Metric):
         # Save any remaining trajectories at the end of epoch
         if self.is_active and self.buffer_count > 0:
             self.save_trajectories()
-
+    
     def compute(self) -> Dict[str, Tensor]:
         # Implement required abstract method
         # Return empty dict as we don't need to compute metrics
