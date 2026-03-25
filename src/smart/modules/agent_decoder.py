@@ -744,3 +744,174 @@ class SMARTAgentDecoder(nn.Module):
             out_dict["pred_z_10hz"] = pred_z.expand(-1, pred_traj_10hz.shape[1])
 
         return out_dict
+    
+    def inference_single_step(
+            self,
+            tokenized_agent: Dict[str, torch.Tensor],
+            map_feature: Dict[str, torch.Tensor],
+            prev_feat_a: torch.Tensor = None,
+            prev_feat_a_t_dict: Dict = None,
+            is_initial_step: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Single step inference for beam search
+        
+        Args:
+            tokenized_agent: Tokenized agent data
+            map_feature: Map feature
+            prev_feat_a: Previous agent features (for non-initial steps)
+            prev_feat_a_t_dict: Previous feature dictionary (for non-initial steps)
+            is_initial_step: Whether this is the initial step
+        
+        Returns:
+            Dictionary with next token logits and intermediate features
+        """
+        n_agent = tokenized_agent["valid_mask"].shape[0]
+        step_current_10hz = self.num_historical_steps - 1  # 10
+        step_current_2hz = step_current_10hz // self.shift  # 2
+        
+        # Get current state
+        pos_a = tokenized_agent["gt_pos"]
+        head_a = tokenized_agent["gt_heading"]
+        head_vector_a = torch.stack([head_a.cos(), head_a.sin()], dim=-1)
+        n_step = pos_a.shape[1]
+        t_now = n_step - 1
+        
+        if is_initial_step:
+            # For initial step, compute agent token embeddings
+            (feat_a, agent_token_emb, agent_token_emb_veh, agent_token_emb_ped, 
+            agent_token_emb_cyc, veh_mask, ped_mask, cyc_mask, categorical_embs) = self.agent_token_embedding(
+                agent_token_index=tokenized_agent["gt_idx"][:, :n_step],
+                trajectory_token_veh=tokenized_agent["trajectory_token_veh"],
+                trajectory_token_ped=tokenized_agent["trajectory_token_ped"],
+                trajectory_token_cyc=tokenized_agent["trajectory_token_cyc"],
+                pos_a=pos_a,
+                head_vector_a=head_vector_a,
+                agent_type=tokenized_agent["type"],
+                agent_shape=tokenized_agent["shape"],
+                inference=True,
+            )
+            feat_a_t_dict = {}
+        else:
+            # For subsequent steps, use previous features
+            feat_a = prev_feat_a
+            feat_a_t_dict = prev_feat_a_t_dict
+        
+        pred_valid = tokenized_agent["valid_mask"].clone()
+        
+        # Build edges
+        if is_initial_step:
+            hist_step = step_current_2hz
+            batch_s = torch.cat([
+                tokenized_agent["batch"] + tokenized_agent["num_graphs"] * t
+                for t in range(hist_step)
+            ], dim=0)
+            batch_pl = torch.cat([
+                map_feature["batch"] + tokenized_agent["num_graphs"] * t
+                for t in range(hist_step)
+            ], dim=0)
+            inference_mask = pred_valid[:, :n_step]
+            edge_index_t, r_t = self.build_temporal_edge(
+                pos_a=pos_a,
+                head_a=head_a,
+                head_vector_a=head_vector_a,
+                mask=pred_valid[:, :n_step],
+            )
+        else:
+            hist_step = 1
+            batch_s = tokenized_agent["batch"]
+            batch_pl = map_feature["batch"]
+            inference_mask = pred_valid[:, :n_step].clone()
+            inference_mask[:, :-1] = False
+            edge_index_t, r_t = self.build_temporal_edge(
+                pos_a=pos_a,
+                head_a=head_a,
+                head_vector_a=head_vector_a,
+                mask=pred_valid[:, :n_step],
+                inference_mask=inference_mask,
+            )
+            edge_index_t[1] = (edge_index_t[1] + 1) // n_step - 1
+        
+        # Build map2agent edge
+        edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
+            pos_pl=map_feature["position"],
+            orient_pl=map_feature["orientation"],
+            pos_a=pos_a[:, -hist_step:],
+            head_a=head_a[:, -hist_step:],
+            head_vector_a=head_vector_a[:, -hist_step:],
+            mask=inference_mask[:, -hist_step:],
+            batch_s=batch_s,
+            batch_pl=batch_pl,
+        )
+        
+        # Build interaction edge
+        edge_index_a2a, r_a2a = self.build_interaction_edge(
+            pos_a=pos_a[:, -hist_step:],
+            head_a=head_a[:, -hist_step:],
+            head_vector_a=head_vector_a[:, -hist_step:],
+            batch_s=batch_s,
+            mask=inference_mask[:, -hist_step:],
+        )
+        
+        # Process through attention layers
+        for i in range(self.num_layers):
+            _feat_temporal = feat_a if i == 0 else feat_a_t_dict[i]
+            
+            if is_initial_step:
+                # Process all historical steps together
+                _feat_temporal = self.t_attn_layers[i](
+                    _feat_temporal.flatten(0, 1), r_t, edge_index_t
+                ).view(n_agent, n_step, -1)
+                _feat_temporal = _feat_temporal.transpose(0, 1).flatten(0, 1)
+                
+                # Expand map features
+                _feat_map = map_feature["pt_token"].unsqueeze(0).expand(hist_step, -1, -1).flatten(0, 1)
+                
+                # Process map2agent attention
+                _feat_temporal = self.pt2a_attn_layers[i](
+                    (_feat_map, _feat_temporal), r_pl2a, edge_index_pl2a
+                )
+                
+                # Process agent2agent attention
+                _feat_temporal = self.a2a_attn_layers[i](
+                    _feat_temporal, r_a2a, edge_index_a2a
+                )
+                
+                _feat_temporal = _feat_temporal.view(n_step, n_agent, -1).transpose(0, 1)
+                feat_a_now = _feat_temporal[:, -1]  # [n_agent, hidden_dim]
+                
+                if i + 1 < self.num_layers:
+                    feat_a_t_dict[i + 1] = _feat_temporal
+            else:
+                # Process only the current step
+                feat_a_now = self.t_attn_layers[i](
+                    (_feat_temporal.flatten(0, 1), _feat_temporal[:, -1]),
+                    r_t, edge_index_t,
+                )
+                
+                # Process map2agent attention
+                feat_a_now = self.pt2a_attn_layers[i](
+                    (map_feature["pt_token"], feat_a_now), r_pl2a, edge_index_pl2a
+                )
+                
+                # Process agent2agent attention
+                feat_a_now = self.a2a_attn_layers[i](
+                    feat_a_now, r_a2a, edge_index_a2a
+                )
+                
+                # Update feature dictionary for next step
+                if i + 1 < self.num_layers:
+                    feat_a_t_dict[i + 1] = torch.cat(
+                        (feat_a_t_dict[i + 1], feat_a_now.unsqueeze(1)), dim=1
+                    )
+        
+        # Predict next token
+        next_token_logits = self.token_predict_head(feat_a_now)
+        
+        return {
+            'next_token_logits': next_token_logits,
+            'feat_a': feat_a if is_initial_step else prev_feat_a,
+            'feat_a_t_dict': feat_a_t_dict,
+            't_now': t_now,
+            'n_step': n_step
+        }

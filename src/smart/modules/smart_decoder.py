@@ -13,6 +13,7 @@
 
 from typing import Dict, Optional
 
+import torch
 import torch.nn as nn
 from omegaconf import DictConfig
 from torch import Tensor
@@ -83,5 +84,46 @@ class SMARTDecoder(nn.Module):
         map_feature = self.map_encoder(tokenized_map)
         pred_dict = self.agent_encoder.inference(
             tokenized_agent, map_feature, sampling_scheme
+        )
+        return pred_dict
+
+    def inference_val(
+        self,
+        map_feature: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        sampling_scheme: DictConfig,
+    ) -> Dict[str, Tensor]:
+        pred_dict = self.agent_encoder.inference(
+            tokenized_agent, map_feature, sampling_scheme
+        )
+        return pred_dict
+    
+    def inference_single_step(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        map_feature: Dict[str, Tensor],
+        prev_feat_a: torch.Tensor = None,
+        prev_feat_a_t_dict: Dict = None,
+        is_initial_step: bool = True,
+    ) -> Dict[str, Tensor]:
+        """
+        Single step inference for beam search
+        
+        Args:
+            tokenized_agent: Tokenized agent data
+            map_feature: Map feature
+            prev_feat_a: Previous agent features (for non-initial steps)
+            prev_feat_a_t_dict: Previous feature dictionary (for non-initial steps)
+            is_initial_step: Whether this is the initial step
+        
+        Returns:
+            Dictionary with next token logits and intermediate features
+        """
+        pred_dict = self.agent_encoder.inference_single_step(
+            tokenized_agent, 
+            map_feature, 
+            prev_feat_a=prev_feat_a,
+            prev_feat_a_t_dict=prev_feat_a_t_dict,
+            is_initial_step=is_initial_step
         )
         return pred_dict

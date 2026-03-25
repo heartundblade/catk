@@ -157,6 +157,7 @@ class TokenProcessor(torch.nn.Module):
             "num_graphs": data.num_graphs,
             "type": data["agent"]["type"],
             "shape": data["agent"]["shape"],
+            "id": data["agent"]["id"],  # [n_agent]
             "ego_mask": data["agent"]["role"][:, 0],  # [n_agent]
             "token_agent_shape": agent_shape,  # [n_agent, 2]
             "batch": data["agent"]["batch"],

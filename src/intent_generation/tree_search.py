@@ -68,12 +68,34 @@ class TreeSearch:
             Best trajectory prediction
         """
         # Initialize root node with initial state
-        root_state = {
+        initial_state = {
             'pos_a': tokenized_agent["gt_pos"][:, :self.model.num_historical_steps//5].clone(),
             'head_a': tokenized_agent["gt_heading"][:, :self.model.num_historical_steps//5].clone(),
             'pred_valid': tokenized_agent["valid_mask"].clone(),
             'pred_idx': tokenized_agent["gt_idx"].clone(),
         }
+        
+        # First step: directly use ground truth
+        if self.max_depth > 0:
+            # Get ground truth for the first step
+            first_gt_pos = tokenized_agent["gt_pos_raw"][:, self.model.num_historical_steps//5].unsqueeze(1)
+            first_gt_head = tokenized_agent["gt_head_raw"][:, self.model.num_historical_steps//5].unsqueeze(1)
+            first_gt_idx = tokenized_agent["gt_idx"][:, self.model.num_historical_steps//5].unsqueeze(1)
+            
+            # Create root state with ground truth
+            root_state = {
+                'pos_a': torch.cat([initial_state['pos_a'], first_gt_pos], dim=1),
+                'head_a': torch.cat([initial_state['head_a'], first_gt_head], dim=1),
+                'pred_valid': initial_state['pred_valid'].clone(),
+                'pred_idx': initial_state['pred_idx'].clone(),
+            }
+            root_state['pred_valid'][:, self.model.num_historical_steps//5] = root_state['pred_valid'][:, self.model.num_historical_steps//5 - 1]
+            root_state['pred_idx'][:, self.model.num_historical_steps//5] = first_gt_idx.squeeze(1)
+            
+            # Adjust max_depth to account for the ground truth step
+            self.max_depth -= 1
+        else:
+            root_state = initial_state
         
         root = Node(root_state)
         
@@ -321,6 +343,7 @@ class TreeSearch:
         current = root
         trajectory = []
         
+        # Traverse to find best trajectory
         while current.children:
             current = max(current.children, key=lambda x: x.value / x.visits if x.visits > 0 else 0)
             trajectory.append(current.action)
@@ -406,6 +429,10 @@ class TreeSearch:
         n_agent, n_step_2hz, _ = pos_a.shape
         n_step_10hz = (n_step_2hz - 1) * 5
         
+        # Handle case when there are no steps to interpolate
+        if n_step_10hz == 0:
+            return torch.empty([n_agent, 0, 2], dtype=pos_a.dtype, device=pos_a.device)
+        
         pred_traj_10hz = torch.zeros([n_agent, n_step_10hz, 2], dtype=pos_a.dtype, device=pos_a.device)
         
         # Interpolate between 2Hz steps
@@ -432,6 +459,10 @@ class TreeSearch:
         """
         n_agent, n_step_2hz = head_a.shape
         n_step_10hz = (n_step_2hz - 1) * 5
+        
+        # Handle case when there are no steps to interpolate
+        if n_step_10hz == 0:
+            return torch.empty([n_agent, 0], dtype=head_a.dtype, device=head_a.device)
         
         pred_head_10hz = torch.zeros([n_agent, n_step_10hz], dtype=head_a.dtype, device=head_a.device)
         

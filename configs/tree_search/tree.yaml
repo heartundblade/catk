@@ -14,3 +14,4 @@ beam_search:
   beam_width: 5  # Beam width (number of candidate sequences to keep)
   max_length: 16  # Maximum sequence length (number of 2Hz steps)
   max_batches: 10  # Maximum number of batches to process
+  max_search_iterations: 6  # Maximum number of search iterations
