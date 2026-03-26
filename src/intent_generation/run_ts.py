@@ -79,12 +79,13 @@ def run(cfg: DictConfig) -> None:
         tokenized_map, tokenized_agent = model.token_processor(data)
         
         # Run search based on search type
-        search_config = cfg.tree_search
-        search_type = search_config.get("search_type", "tree")
+        search_type = cfg.get("search_type", "tree")
         
         if search_type == "tree":
+            search_config = cfg.tree_search.tree_search
             result = run_tree_search(model, tokenized_map, tokenized_agent, search_config)
         elif search_type == "beam":
+            search_config = cfg.tree_search.beam_search
             result = run_beam_search(model, tokenized_map, tokenized_agent, search_config)
         else:
             raise ValueError(f"Unknown search type: {search_type}")
@@ -128,8 +129,9 @@ def main(cfg: DictConfig) -> None:
     """
     torch.set_printoptions(precision=3)
 
-    log.info("Printing config tree with Rich! <cfg.extras.print_config=True>")
-    print_config_tree(cfg, resolve=True, save_to_file=True)
+    # Skip printing config tree to avoid interpolation errors
+    # log.info("Printing config tree with Rich! <cfg.extras.print_config=True>")
+    # print_config_tree(cfg, resolve=True, save_to_file=True)
 
     run(cfg)  # run tree search
 
