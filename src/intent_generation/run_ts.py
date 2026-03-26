@@ -62,7 +62,7 @@ def run(cfg: DictConfig) -> None:
     # Prepare data
     datamodule.prepare_data()
     datamodule.setup("validate")
-    validate_dataloader = datamodule.validate_dataloader()
+    validate_dataloader = datamodule.val_dataloader()
 
     # Results storage
     all_results = []
@@ -118,7 +118,7 @@ def run(cfg: DictConfig) -> None:
     log.info(f"Saved {len(all_results)} agent trajectories to {output_file}")
 
 
-@hydra.main(config_path="../../configs/", config_name="run.yaml", version_base=None)
+@hydra.main(config_path="../../configs/", config_name="run_ts.yaml", version_base=None)
 def main(cfg: DictConfig) -> None:
     """
     Main function for tree search

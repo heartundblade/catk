@@ -235,8 +235,6 @@ class TrajectoryRecorder(Metric):
                     agent_data["ground_truth"] = {
                         "trajectory": self.gt_traj[i][j].numpy().tolist(),
                         "valid": self.gt_valid[i][j].numpy().tolist() if hasattr(self, 'gt_valid') and len(self.gt_valid) > i else None
-                        "trajectory": self.gt_traj[i][j].numpy().tolist(),
-                        "valid": self.gt_valid[i][j].numpy().tolist() if hasattr(self, 'gt_valid') and len(self.gt_valid) > i else None
                     }
                 
                 scenario_data["agents"].append(agent_data)
