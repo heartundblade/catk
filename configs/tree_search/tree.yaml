@@ -1,5 +1,5 @@
 # Tree search and beam search configuration
-search_type: tree  # Search type: tree or beam
+search_type: beam  # Search type: tree or beam
 
 # Tree search parameters
 tree_search:

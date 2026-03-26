@@ -100,8 +100,8 @@ class SMARTDecoder(nn.Module):
     
     def inference_single_step(
         self,
+        tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
-        map_feature: Dict[str, Tensor],
         prev_feat_a: torch.Tensor = None,
         prev_feat_a_t_dict: Dict = None,
         is_initial_step: bool = True,
@@ -110,8 +110,8 @@ class SMARTDecoder(nn.Module):
         Single step inference for beam search
         
         Args:
+            tokenized_map: Tokenized map data
             tokenized_agent: Tokenized agent data
-            map_feature: Map feature
             prev_feat_a: Previous agent features (for non-initial steps)
             prev_feat_a_t_dict: Previous feature dictionary (for non-initial steps)
             is_initial_step: Whether this is the initial step
@@ -119,6 +119,7 @@ class SMARTDecoder(nn.Module):
         Returns:
             Dictionary with next token logits and intermediate features
         """
+        map_feature = self.map_encoder(tokenized_map)
         pred_dict = self.agent_encoder.inference_single_step(
             tokenized_agent, 
             map_feature, 
