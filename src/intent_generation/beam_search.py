@@ -169,6 +169,7 @@ class BeamSearch:
         
         # Perform beam search
         for step in range(self.max_length):
+            print(f"Beam search step {step}")
             new_beam = []
             
             # Calculate current step in terms of ground truth
@@ -308,7 +309,9 @@ class BeamSearch:
                     next_token_logits = pred_dict['next_token_logits']  # [1, n_token]
                     
                     # Get top-k tokens and their scores
-                    topk_scores, topk_indices = torch.topk(next_token_logits, k=self.beam_width, dim=1)  # topk_scores: [1, beam_width], topk_indices: [1, beam_width]
+                    topk_scores, topk_indices = torch.topk(
+                        next_token_logits, k=self.beam_width, dim=1
+                        )  # topk_scores: [1, beam_width], topk_indices: [1, beam_width]
                     
                     # Generate child states
                     for i in range(self.beam_width):

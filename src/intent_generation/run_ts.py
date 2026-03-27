@@ -79,7 +79,7 @@ def run(cfg: DictConfig) -> None:
         tokenized_map, tokenized_agent = model.token_processor(data)
         
         # Run search based on search type
-        search_type = cfg.get("search_type", "tree")
+        search_type = cfg.tree_search.get("search_type", "tree")
         
         if search_type == "tree":
             search_config = cfg.tree_search.tree_search
