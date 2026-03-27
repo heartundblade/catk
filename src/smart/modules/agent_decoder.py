@@ -771,8 +771,8 @@ class SMARTAgentDecoder(nn.Module):
         step_current_2hz = step_current_10hz // self.shift  # 2
         
         # Get current state
-        pos_a = tokenized_agent["gt_pos"]
-        head_a = tokenized_agent["gt_heading"]
+        pos_a = tokenized_agent["pos"]
+        head_a = tokenized_agent["heading"]
         head_vector_a = torch.stack([head_a.cos(), head_a.sin()], dim=-1)
         n_step = pos_a.shape[1]
         t_now = n_step - 1
