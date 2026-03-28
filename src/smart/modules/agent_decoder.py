@@ -777,7 +777,7 @@ class SMARTAgentDecoder(nn.Module):
         n_step = pos_a.shape[1]
         t_now = n_step - 1
         
-        if is_initial_step:
+        if prev_feat_a is None or prev_feat_a_t_dict is None:
             # For initial step, compute agent token embeddings
             (feat_a, agent_token_emb, agent_token_emb_veh, agent_token_emb_ped, 
             agent_token_emb_cyc, veh_mask, ped_mask, cyc_mask, categorical_embs) = self.agent_token_embedding(

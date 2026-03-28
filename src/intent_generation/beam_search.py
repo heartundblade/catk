@@ -217,21 +217,6 @@ class BeamSearch:
                     temp_full_tokenized_agent['heading'],
                     new_heading
                 ], dim=1)
-                
-                # Also append to id to maintain consistent time steps
-                if 'id' in temp_full_tokenized_agent:
-                    # Repeat the last token index for the new step
-                    temp_full_tokenized_agent['id'] = torch.cat([
-                        temp_full_tokenized_agent['id'],
-                        temp_full_tokenized_agent['id'][:, -1:]
-                    ], dim=1)
-                # Also update valid_mask if present
-                if 'valid_mask' in temp_full_tokenized_agent:
-                    # Extend valid_mask with the last value
-                    temp_full_tokenized_agent['valid_mask'] = torch.cat([
-                        temp_full_tokenized_agent['valid_mask'],
-                        temp_full_tokenized_agent['valid_mask'][:, -1:]
-                    ], dim=1)
             
             # Update all agents with ground truth
             if current_gt_step < full_tokenized_agent['gt_pos'].shape[1]:
@@ -243,15 +228,18 @@ class BeamSearch:
                 for agent_idx in range(n_agent):
                     temp_full_tokenized_agent['gt_pos'][agent_idx:agent_idx+1, t_now+1:t_now+2] = gt_pos_all[agent_idx:agent_idx+1]
                     temp_full_tokenized_agent['gt_heading'][agent_idx:agent_idx+1, t_now+1:t_now+2] = gt_heading_all[agent_idx:agent_idx+1]
-            
-            # Use the updated full tokenized agent data
-            temp_tokenized_agent = temp_full_tokenized_agent
+                    
+        # Get ground truth action token indice for the first step
+        gt_action = None
+        if 'gt_idx' in tokenized_agent and tokenized_agent['gt_idx'].shape[1] > historical_steps:
+            # Get the current agent's action token indice directly from tokenized_agent
+            gt_action = tokenized_agent['gt_idx'][:, historical_steps]  # [1]
         
         # Update initial state with ground truth for first step
         # Use _generate_child_state_with_gt to update the state with ground truth
         initial_state = self._generate_child_state_with_gt(
             initial_state,
-            None,  # No action needed for ground truth step
+            gt_action,  # Use ground truth action token indice
             torch.zeros_like(initial_state['score']),  # No score change for ground truth
             temp_tokenized_agent, 
             current_gt_pos,
@@ -283,7 +271,7 @@ class BeamSearch:
                 temp_tokenized_agent['heading'] = head_a
                 
                 # Check if this is the initial step for this state
-                is_initial_step = (pos_a.shape[1] == historical_steps)
+                is_initial_step = step == 1  # Step 1 is the first step after the initial state which already used ground truth
                 
                 # Get previous features if available
                 prev_feat_a = state.get('feat_a', None)
@@ -291,7 +279,7 @@ class BeamSearch:
                 
                 # Run single step inference before updating with ground truth
                 pred_dict = self.model.encoder.agent_encoder.inference_single_step(
-                    temp_tokenized_agent, 
+                    temp_full_tokenized_agent, 
                     map_feature, 
                     prev_feat_a=prev_feat_a,
                     prev_feat_a_t_dict=prev_feat_a_t_dict,
@@ -380,13 +368,6 @@ class BeamSearch:
                                 temp_tokenized_agent['idx'],
                                 temp_tokenized_agent['idx'][:, -1:]
                             ], dim=1)
-                        # Also update pred_valid if present
-                        # if 'valid_mask' in temp_tokenized_agent:
-                        #     # Extend valid_mask with the last value
-                        #     temp_tokenized_agent['valid_mask'] = torch.cat([
-                        #         temp_tokenized_agent['valid_mask'],
-                        #         temp_tokenized_agent['valid_mask'][:, -1:]
-                        #     ], dim=1)
                     else:
                         # Otherwise, update the specific step
                         temp_tokenized_agent['pos'][0:1, t_now+1:t_now+2] = pos_a[:, -1:]
@@ -518,14 +499,21 @@ class BeamSearch:
         pred_idx[:, n_step] = action
         new_score = parent_score + score
         
+        # Handle case when pred_dict is None (e.g., when using ground truth)
+        feat_a = None
+        feat_a_t_dict = None
+        if pred_dict is not None:
+            feat_a = pred_dict.get('feat_a', None)
+            feat_a_t_dict = pred_dict.get('feat_a_t_dict', None)
+        
         return {
             'pos_a': pos_a,
             'head_a': head_a,
             'pred_valid': pred_valid,
             'pred_idx': pred_idx,
             'score': new_score,
-            'feat_a': pred_dict.get('feat_a', None),
-            'feat_a_t_dict': pred_dict.get('feat_a_t_dict', None)
+            'feat_a': feat_a,
+            'feat_a_t_dict': feat_a_t_dict
         }
     
     def _convert_to_10hz(
