@@ -48,7 +48,8 @@ class BeamSearch:
     def search(
         self,
         tokenized_map: Dict[str, torch.Tensor],
-        tokenized_agent: Dict[str, torch.Tensor]
+        tokenized_agent: Dict[str, torch.Tensor],
+        search_iter: int = 0
     ) -> Dict[str, torch.Tensor]:
         """
         Perform beam search for each agent independently
@@ -69,7 +70,7 @@ class BeamSearch:
         valid_mask = tokenized_agent["valid_mask"]  # [n_agent, n_step]
         
         # Get first step's ground truth (only use for first step)
-        first_step = self.model.num_historical_steps//5
+        first_step = self.model.num_historical_steps//5 + search_iter
         first_step_gt_pos = None
         first_step_gt_heading = None
         first_step_valid_mask = None
@@ -97,7 +98,6 @@ class BeamSearch:
             
             # Run beam search for this agent
             agent_result = self._search_single_agent(
-                tokenized_map, 
                 single_agent_data, 
                 map_feature, 
                 agent_first_step_gt_pos, 
@@ -128,7 +128,6 @@ class BeamSearch:
     
     def _search_single_agent(
         self,
-        tokenized_map: Dict[str, torch.Tensor],
         tokenized_agent: Dict[str, torch.Tensor],
         map_feature: torch.Tensor,
         first_step_gt_pos: torch.Tensor,
@@ -140,12 +139,11 @@ class BeamSearch:
         Perform beam search for a single agent
         
         Args:
-            tokenized_map: Tokenized map data
             tokenized_agent: Tokenized agent data (single agent)
             map_feature: Pre-computed map feature
             first_step_gt_pos: Ground truth position for first step
-            first_step_gt_head: Ground truth heading for first step
-            first_step_gt_valid: Ground truth validity for first step
+            first_step_gt_heading: Ground truth heading for first step
+            first_step_gt_valid_mask: Ground truth validity for first step
             full_tokenized_agent: Full tokenized agent data including all agents
         
         Returns:
@@ -193,31 +191,46 @@ class BeamSearch:
             # Get number of agents
             n_agent = full_tokenized_agent['gt_pos'].shape[0]
             
-            # Update surrounding agents' positions and headings to ground truth
-            # at the current step
-            if temp_full_tokenized_agent['pos'].shape[1] <= t_now + 1:
-                # If not enough steps, append zeros for all agents
-                device = temp_full_tokenized_agent['pos'].device
-
-                if current_gt_step < full_tokenized_agent['gt_pos'].shape[1]:
-                    gt_pos_all = full_tokenized_agent['gt_pos'][:, current_gt_step:current_gt_step+1]
-                    gt_heading_all = full_tokenized_agent['gt_heading'][:, current_gt_step:current_gt_step+1]
-                    
-                    # Append the new step
-                    temp_full_tokenized_agent['pos'] = torch.cat([
-                        temp_full_tokenized_agent['pos'],
-                        gt_pos_all
-                    ], dim=1)
-                    temp_full_tokenized_agent['heading'] = torch.cat([
-                        temp_full_tokenized_agent['heading'],
-                        gt_heading_all
-                    ], dim=1)
-
+            # Update agents' positions and headings to ground truth at the current step
+            if current_gt_step < full_tokenized_agent['gt_pos'].shape[1]:
+                gt_pos_all = full_tokenized_agent['gt_pos'][:, current_gt_step:current_gt_step+1]
+                gt_heading_all = full_tokenized_agent['gt_heading'][:, current_gt_step:current_gt_step+1]
+                
+                # Append the new step
+                temp_full_tokenized_agent['pos'] = torch.cat([
+                    temp_full_tokenized_agent['pos'],
+                    gt_pos_all
+                ], dim=1)
+                temp_full_tokenized_agent['heading'] = torch.cat([
+                    temp_full_tokenized_agent['heading'],
+                    gt_heading_all
+                ], dim=1)
+        
         # Get ground truth action token indice for the first step
         gt_action = None
         if 'gt_idx' in tokenized_agent and tokenized_agent['gt_idx'].shape[1] > historical_steps:
             # Get the current agent's action token indice directly from tokenized_agent
             gt_action = tokenized_agent['gt_idx'][:, historical_steps]  # [1]
+        
+        # Todo: use matrix computation to get update_mask instead of looping through agents
+        # Create a mask to identify which agents to update with ground truth
+        update_mask = torch.ones(n_agent, dtype=torch.bool, device=temp_full_tokenized_agent['gt_pos'].device)
+        # Get current agent's index in full_tokenized_agent if available
+        current_agent_idx = 0
+        if current_agent_id is not None and 'id' in full_tokenized_agent:
+            for idx in range(n_agent):
+                if full_tokenized_agent['id'][idx].item() == current_agent_id:
+                    current_agent_idx = idx
+                    update_mask[idx] = False
+                    break
+        else:
+            # If no agent ID, assume first agent is current
+            update_mask[0] = False
+        
+        # Update current agent's state using the beam state
+        # Use the inverse of update_mask to identify current agent
+        current_agent_mask = ~update_mask
+        current_agent_mask = current_agent_mask.unsqueeze(1).unsqueeze(2)  # [n_agent, 1, 1]
         
         # Update initial state with ground truth for first step
         # Use _generate_child_state_with_gt to update the state with ground truth
@@ -255,69 +268,7 @@ class BeamSearch:
                 prev_feat_a = state.get('feat_a', None)
                 prev_feat_a_t_dict = state.get('feat_a_t_dict', None)
                 
-                # Todo: update current agent's state in temp_full_tokenized_agent
-                # Run single step inference before updating with ground truth
-                pred_dict = self.model.encoder.agent_encoder.inference_single_step(
-                    temp_full_tokenized_agent, 
-                    map_feature, 
-                    prev_feat_a=prev_feat_a,
-                    prev_feat_a_t_dict=prev_feat_a_t_dict,
-                    is_initial_step=is_initial_step
-                )
-
-                # Update surrounding agents' states with ground truth
-                if full_tokenized_agent is not None:
-                    # Update surrounding agents' positions and headings to ground truth
-                    # at the current step
-                    device = temp_full_tokenized_agent['gt_pos'].device
-                    
-                    # Create zero tensors for the new step
-                    new_pos = torch.zeros([n_agent, 1, 2], device=device)
-                    new_head = torch.zeros([n_agent, 1], device=device)
-                    
-                    # Append the new step
-                    temp_full_tokenized_agent['pos'] = torch.cat([
-                        temp_full_tokenized_agent['pos'],
-                        new_pos
-                    ], dim=1)
-                    temp_full_tokenized_agent['heading'] = torch.cat([
-                        temp_full_tokenized_agent['heading'],
-                        new_head
-                    ], dim=1)
-                    
-                    # Create a mask to identify which agents to update with ground truth
-                    n_agent = full_tokenized_agent['gt_pos'].shape[0]
-                    update_mask = torch.ones(n_agent, dtype=torch.bool, device=temp_full_tokenized_agent['gt_pos'].device)
-                    
-                    # Todo: use matrix computation to get update_mask instead of looping through agents
-                    # Mark current agent as not to be updated
-                    if current_agent_id is not None and 'id' in full_tokenized_agent:
-                        for idx in range(n_agent):
-                            if full_tokenized_agent['id'][idx].item() == current_agent_id:
-                                update_mask[idx] = False
-                                break
-                    else:
-                        # If no agent ID, assume first agent is current
-                        update_mask[0] = False
-                    
-                    # Todo: use matrix computation to update all agents once instead of looping through agents
-                    # Update agents with ground truth where mask is True
-                    if current_gt_step < full_tokenized_agent['gt_pos'].shape[1]:
-                        # Get ground truth for all agents at current step
-                        gt_pos_all = full_tokenized_agent['gt_pos'][:, current_gt_step:current_gt_step+1]
-                        gt_head_all = full_tokenized_agent['gt_heading'][:, current_gt_step:current_gt_step+1]
-                        
-                        # Apply ground truth only to agents where update_mask is True
-                        for agent_idx in range(n_agent):
-                            if update_mask[agent_idx]:
-                                temp_full_tokenized_agent['pos'][agent_idx:agent_idx+1, t_now+1:t_now+2] = gt_pos_all[agent_idx:agent_idx+1]
-                                temp_full_tokenized_agent['heading'][agent_idx:agent_idx+1, t_now+1:t_now+2] = gt_head_all[agent_idx:agent_idx+1]
-
-                    # Update current agent's state using the beam state
-                    # Use the inverse of update_mask to identify current agent
-                    current_agent_mask = ~update_mask
-                    current_agent_mask = current_agent_mask.unsqueeze(1).unsqueeze(2)  # [n_agent, 1, 1]
-
+                if not is_initial_step:
                     # Update position and heading for current agent only
                     temp_full_tokenized_agent['pos'][:, t_now+1:t_now+2] = torch.where(
                         current_agent_mask.expand(-1, 1, 2),
@@ -329,17 +280,49 @@ class BeamSearch:
                         head_a[:, -1:].expand(n_agent, 1),
                         temp_full_tokenized_agent['heading'][:, t_now+1:t_now+2]
                     )
+                
+                # Run single step inference before updating with ground truth
+                pred_dict = self.model.encoder.agent_encoder.inference_single_step(
+                    temp_full_tokenized_agent, 
+                    map_feature, 
+                    prev_feat_a=prev_feat_a,
+                    prev_feat_a_t_dict=prev_feat_a_t_dict,
+                    is_initial_step=is_initial_step
+                )
 
-                    current_agent_idx = 0
-                    if current_agent_id is not None and 'id' in full_tokenized_agent:
-                        for idx in range(n_agent):
-                            if full_tokenized_agent['id'][idx].item() == current_agent_id:
-                                current_agent_idx = idx
-                                break
-                    pred_dict['next_token_logits'] = pred_dict['next_token_logits'][current_agent_idx:current_agent_idx+1]
+                # Update surrounding agents' states with ground truth
+                device = temp_full_tokenized_agent['gt_pos'].device
+                
+                # Create zero tensors for the new step
+                new_pos = torch.zeros([n_agent, 1, 2], device=device)
+                new_head = torch.zeros([n_agent, 1], device=device)
+                temp_full_tokenized_agent['pos'] = torch.cat([
+                    temp_full_tokenized_agent['pos'],
+                    new_pos
+                ], dim=1)
+                temp_full_tokenized_agent['heading'] = torch.cat([
+                    temp_full_tokenized_agent['heading'],
+                    new_head
+                ], dim=1)
+                
+                # Update agents with ground truth where mask is True
+                if current_gt_step < full_tokenized_agent['gt_pos'].shape[1]:
+                    # Get ground truth for all agents at current step
+                    gt_pos_all = full_tokenized_agent['gt_pos'][:, current_gt_step:current_gt_step+1]
+                    gt_head_all = full_tokenized_agent['gt_heading'][:, current_gt_step:current_gt_step+1]
+                    
+                    temp_full_tokenized_agent['pos'][update_mask, t_now+1:t_now+2] = gt_pos_all[update_mask]
+                    temp_full_tokenized_agent['heading'][update_mask, t_now+1:t_now+2] = gt_head_all[update_mask]
+                    # Apply ground truth only to agents where update_mask is True
+                    # for agent_idx in range(n_agent):
+                    #     if update_mask[agent_idx]:
+                    #         temp_full_tokenized_agent['pos'][agent_idx:agent_idx+1, t_now+1:t_now+2] = gt_pos_all[agent_idx:agent_idx+1]
+                    #         temp_full_tokenized_agent['heading'][agent_idx:agent_idx+1, t_now+1:t_now+2] = gt_head_all[agent_idx:agent_idx+1]
                 
                 # Get next token logits for this agent
-                next_token_logits = pred_dict['next_token_logits']  # [1, n_token]
+                next_token_logits = pred_dict['next_token_logits'][
+                    current_agent_idx:current_agent_idx+1
+                    ]  # [1, n_token]
                 
                 # Get top-k tokens and their scores
                 topk_scores, topk_indices = torch.topk(
@@ -560,7 +543,7 @@ class BeamSearch:
         search_history = []
         
         # Get ground truth trajectory length and historical steps
-        gt_length = tokenized_agent["gt_pos_raw"].shape[1]
+        gt_length = tokenized_agent["gt_pos"].shape[1]
         
         # Calculate historical steps in 2Hz (following agent_decoder.py logic)
         # step_current_10hz = self.model.num_historical_steps - 1  # 10
@@ -589,7 +572,7 @@ class BeamSearch:
             current_tokenized_agent['idx'] = current_state['idx']
             
             # Run one beam search
-            search_result = self.search(tokenized_map, current_tokenized_agent)
+            search_result = self.search(tokenized_map, current_tokenized_agent, search_iter)
             
             # Record search result
             search_history.append(search_result)
@@ -599,36 +582,28 @@ class BeamSearch:
             if current_step + 1 >= gt_length:
                 break
             
-            # Get current ground truth step
-            current_gt_step = current_step
-            next_gt_step = current_gt_step + 1
-            
             # Update position and heading data using search result for the current agent
             # and ground truth for historical data
             # Keep historical ground truth data and append new search result data
             # Note: We're using search result for the current step, but ground truth for other agents
             new_pos = torch.cat([
                 current_state['pos'],
-                search_result['pred_pos'][:, -1:]
+                tokenized_agent['gt_pos'][:, current_step:current_step+1]
             ], dim=1)
             new_heading = torch.cat([
                 current_state['heading'],
-                search_result['pred_head'][:, -1:]
-            ], dim=1)
-            new_valid_mask = torch.cat([
-                current_state['valid_mask'],
-                current_state['valid_mask'][:, -1:]
+                tokenized_agent['gt_heading'][:, current_step:current_step+1]
             ], dim=1)
             new_idx = torch.cat([
                 current_state['idx'],
-                current_state['idx'][:, -1:]
+                tokenized_agent['gt_idx'][:, current_step:current_step+1]
             ], dim=1)
             
             # Update current state
             current_state = {
                 'pos': new_pos,
                 'heading': new_heading,
-                'valid_mask': new_valid_mask,
+                'valid_mask': current_tokenized_agent['valid_mask'],
                 'idx': new_idx
             }
         
