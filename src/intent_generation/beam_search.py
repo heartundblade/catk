@@ -238,7 +238,8 @@ class BeamSearch:
             initial_state,
             gt_action,  # Use ground truth action token indice
             torch.zeros_like(initial_state['score']),  # No score change for ground truth
-            temp_full_tokenized_agent, 
+            temp_full_tokenized_agent,
+            current_agent_mask,
             current_gt_pos,
             current_gt_heading,
             current_valid_mask,
@@ -340,6 +341,7 @@ class BeamSearch:
                         action,
                         score,
                         temp_full_tokenized_agent,  # Use the updated temp_tokenized_agent instead of original
+                        current_agent_mask,
                         None,  # current_gt_pos
                         None,  # current_gt_heading
                         None,  # current_valid_mask
@@ -366,6 +368,7 @@ class BeamSearch:
         action: torch.Tensor,
         score: torch.Tensor,
         tokenized_agent: Dict[str, torch.Tensor],
+        current_agent_mask: torch.Tensor,
         gt_pos: torch.Tensor,
         gt_head: torch.Tensor,
         gt_valid: torch.Tensor,
@@ -424,9 +427,12 @@ class BeamSearch:
             diff_xy_next = token_traj_global[:, -1, 0] - token_traj_global[:, -1, 3]
             head_a_next = torch.arctan2(diff_xy_next[:, 1], diff_xy_next[:, 0])
             
+            pos_a_next_current = torch.masked_select(pos_a_next, current_agent_mask).view(-1, 1, 2)
+            head_a_next_current = torch.masked_select(head_a_next, current_agent_mask).view(-1, 1, 1)
+            
             # Update state
-            pos_a = torch.cat([pos_a, pos_a_next.unsqueeze(1)], dim=1)
-            head_a = torch.cat([head_a, head_a_next.unsqueeze(1)], dim=1)
+            pos_a = torch.cat([pos_a, pos_a_next_current], dim=1)
+            head_a = torch.cat([head_a, head_a_next_current], dim=1)
             pred_valid[:, n_step] = pred_valid[:, t_now]
         
         # Update prediction index and score

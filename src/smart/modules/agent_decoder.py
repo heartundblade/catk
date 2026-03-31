@@ -777,25 +777,19 @@ class SMARTAgentDecoder(nn.Module):
         n_step = pos_a.shape[1]
         t_now = n_step - 1
         
-        if prev_feat_a is None or prev_feat_a_t_dict is None:
-            # For initial step, compute agent token embeddings
-            (feat_a, agent_token_emb, agent_token_emb_veh, agent_token_emb_ped, 
-            agent_token_emb_cyc, veh_mask, ped_mask, cyc_mask, categorical_embs) = self.agent_token_embedding(
-                agent_token_index=tokenized_agent["gt_idx"][:, :n_step],
-                trajectory_token_veh=tokenized_agent["trajectory_token_veh"],
-                trajectory_token_ped=tokenized_agent["trajectory_token_ped"],
-                trajectory_token_cyc=tokenized_agent["trajectory_token_cyc"],
-                pos_a=pos_a,
-                head_vector_a=head_vector_a,
-                agent_type=tokenized_agent["type"],
-                agent_shape=tokenized_agent["shape"],
-                inference=True,
-            )
-            feat_a_t_dict = {}
-        else:
-            # For subsequent steps, use previous features
-            feat_a = prev_feat_a
-            feat_a_t_dict = prev_feat_a_t_dict
+        (feat_a, agent_token_emb, agent_token_emb_veh, agent_token_emb_ped, 
+        agent_token_emb_cyc, veh_mask, ped_mask, cyc_mask, categorical_embs) = self.agent_token_embedding(
+            agent_token_index=tokenized_agent["gt_idx"][:, :n_step],
+            trajectory_token_veh=tokenized_agent["trajectory_token_veh"],
+            trajectory_token_ped=tokenized_agent["trajectory_token_ped"],
+            trajectory_token_cyc=tokenized_agent["trajectory_token_cyc"],
+            pos_a=pos_a,
+            head_vector_a=head_vector_a,
+            agent_type=tokenized_agent["type"],
+            agent_shape=tokenized_agent["shape"],
+            inference=True,
+        )
+        feat_a_t_dict = {}
         
         pred_valid = tokenized_agent["valid_mask"].clone()
         
@@ -910,7 +904,7 @@ class SMARTAgentDecoder(nn.Module):
         
         return {
             'next_token_logits': next_token_logits,
-            'feat_a': feat_a if is_initial_step else prev_feat_a,
+            'feat_a': feat_a,
             'feat_a_t_dict': feat_a_t_dict,
             't_now': t_now,
             'n_step': n_step
