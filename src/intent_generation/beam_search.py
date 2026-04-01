@@ -131,6 +131,34 @@ class BeamSearch:
             'agent_ids': agent_ids,  # [n_agent, 1]
         }
     
+    def agent_token_emb_with_prev_feat(
+        self,
+        tokenized_agent: Dict[str, torch.Tensor],
+        prev_feat_a: torch.Tensor,
+        prev_feat_a_t_dict: Dict
+    ) -> torch.Tensor:
+        """
+        Get token embedding with previous features
+        
+        Args:
+            tokenized_agent: Tokenized agent data
+            prev_feat_a: Previous agent feature
+            prev_feat_a_t_dict: Previous agent temporal features
+        
+        Returns:
+            Token embedding with previous features
+        """
+        # Get current token embedding
+        token_emb = self.model.encoder.agent_encoder.token_embedding(tokenized_agent)  # [1, n_historical_step, d_model]
+        
+        # Combine with previous features if available
+        if prev_feat_a is not None and prev_feat_a_t_dict is not None:
+            # For simplicity, just concatenate along feature dimension (this can be improved with a learnable fusion)
+            combined_emb = torch.cat([token_emb, prev_feat_a], dim=-1)  # [1, n_historical_step, d_model + feat_dim]
+            return combined_emb
+        else:
+            return token_emb
+
     def _search_single_agent(
         self,
         tokenized_agent: Dict[str, torch.Tensor],
@@ -221,13 +249,14 @@ class BeamSearch:
         # Create a mask to identify which agents to update with ground truth
         update_mask = torch.ones(n_agent, dtype=torch.bool, device=temp_full_tokenized_agent['gt_pos'].device)
         # Get current agent's index in full_tokenized_agent if available
-        current_agent_idx = 0
+        # current_agent_idx = 0
         if current_agent_id is not None and 'id' in full_tokenized_agent:
-            for idx in range(n_agent):
-                if full_tokenized_agent['id'][idx].item() == current_agent_id:
-                    current_agent_idx = idx
-                    update_mask[idx] = False
-                    break
+            update_mask = full_tokenized_agent['id'] != current_agent_id
+            # for idx in range(n_agent):
+            #     if full_tokenized_agent['id'][idx].item() == current_agent_id:
+            #         current_agent_idx = idx
+            #         update_mask[idx] = False
+            #         break
         else:
             # If no agent ID, assume first agent is current
             update_mask[0] = False
@@ -290,6 +319,15 @@ class BeamSearch:
             # Check if this is the initial step for this state
             is_initial_step = step == 1  # Step 1 is the first step after the initial state which already used ground truth
             
+            # pred_dicts = self.model.encoder.agent_encoder.inference_single_step_state_batch(
+            #     temp_full_tokenized_agent,
+            #     map_feature,
+            #     prev_feat_a=prev_feat_a,
+            #     prev_feat_a_t_dict=prev_feat_a_t_dict,
+            #     states=beam,
+            #     is_initial_step=is_initial_step,
+            # )
+
             # For subsequent steps, don't use ground truth for the agent being searched
             for state in beam:
                 # Get current state
@@ -297,6 +335,7 @@ class BeamSearch:
                 head_a = state['head_a'].clone()
                 t_now = pos_a.shape[1] - 1
                 
+                # Todo: compute feat_a with previous features
                 # Get previous features if available
                 prev_feat_a = state.get('feat_a', None)
                 prev_feat_a_t_dict = state.get('feat_a_t_dict', None)
@@ -314,6 +353,7 @@ class BeamSearch:
                         temp_full_tokenized_agent['heading'][:, t_now+1:t_now+2]
                     )
                 
+                # Todo: parrelize the search by creating a batch of states instead of looping through states
                 # Run single step inference before updating with ground truth
                 pred_dict = self.model.encoder.agent_encoder.inference_single_step(
                     temp_full_tokenized_agent, 
@@ -324,14 +364,17 @@ class BeamSearch:
                 )
                 
                 # Get next token logits for this agent
-                next_token_logits = pred_dict['next_token_logits'][
-                    current_agent_idx:current_agent_idx+1
-                    ]  # [1, n_token]
+                # next_token_logits = pred_dict['next_token_logits'][
+                #     current_agent_idx:current_agent_idx+1
+                #     ]  # [1, n_token]
+                next_token_logits = torch.masked_select(
+                    pred_dict['next_token_logits'], current_agent_mask
+                    ) # [1, n_token]
                 
                 # Get top-k tokens and their scores
                 topk_scores, topk_indices = torch.topk(
                     next_token_logits, k=self.beam_width, dim=1
-                    )  # topk_scores: [1, beam_width], topk_indices: [1, beam_width]
+                    )  # topk_scores, topk_indices: [1, beam_width]
                 
                 # Generate child states
                 for i in range(self.beam_width):
