@@ -795,7 +795,7 @@ class SMARTAgentDecoder(nn.Module):
         
         # Build edges
         if is_initial_step:
-            hist_step = step_current_2hz
+            hist_step = n_step
             batch_s = torch.cat([
                 tokenized_agent["batch"] + tokenized_agent["num_graphs"] * t
                 for t in range(hist_step)
@@ -851,46 +851,40 @@ class SMARTAgentDecoder(nn.Module):
         for i in range(self.num_layers):
             _feat_temporal = feat_a if i == 0 else feat_a_t_dict[i]
 
-            # Process all historical steps together
-            _feat_temporal = self.t_attn_layers[i](
-                _feat_temporal.flatten(0, 1), r_t, edge_index_t
-            ).view(n_agent, n_step, -1)
-            _feat_temporal = _feat_temporal.transpose(0, 1).flatten(0, 1)
-            
-            # Expand map features
-            _feat_map = map_feature["pt_token"].unsqueeze(0).expand(hist_step, -1, -1).flatten(0, 1)
-            
-            # Process map2agent attention
-            _feat_temporal = self.pt2a_attn_layers[i](
-                (_feat_map, _feat_temporal), r_pl2a, edge_index_pl2a
-            )
-            
-            # Process agent2agent attention
-            _feat_temporal = self.a2a_attn_layers[i](
-                _feat_temporal, r_a2a, edge_index_a2a
-            )
-            
-            _feat_temporal = _feat_temporal.view(n_step, n_agent, -1).transpose(0, 1)
-            feat_a_now = _feat_temporal[:, -1]  # [n_agent, hidden_dim]
-            
-            if i + 1 < self.num_layers:
-                feat_a_t_dict[i + 1] = _feat_temporal
-            
+            if is_initial_step:
+                # Process all historical steps together
+                _feat_temporal = self.t_attn_layers[i](
+                    _feat_temporal.flatten(0, 1), r_t, edge_index_t
+                ).view(n_agent, n_step, -1)
+                _feat_temporal = _feat_temporal.transpose(0, 1).flatten(0, 1)
+                
+                # Expand map features
+                _feat_map = map_feature["pt_token"].unsqueeze(0).expand(hist_step, -1, -1).flatten(0, 1)
+                
+                # Process map2agent attention
+                _feat_temporal = self.pt2a_attn_layers[i](
+                    (_feat_map, _feat_temporal), r_pl2a, edge_index_pl2a
+                )
+                
+                # Process agent2agent attention
+                _feat_temporal = self.a2a_attn_layers[i](
+                    _feat_temporal, r_a2a, edge_index_a2a
+                )
+                
+                _feat_temporal = _feat_temporal.view(n_step, n_agent, -1).transpose(0, 1)
+                feat_a_now = _feat_temporal[:, -1]  # [n_agent, hidden_dim]
+                
+                if i + 1 < self.num_layers:
+                    feat_a_t_dict[i + 1] = _feat_temporal
             # else:
-            #     print(f"Edge index shape: {edge_index_t.shape}")
-            #     print(f"Max edge index: {edge_index_t.max().item() if edge_index_t.numel() > 0 else 0}")
             #     # Process only the current step
             #     feat_a_now = self.t_attn_layers[i](
             #         (_feat_temporal.flatten(0, 1), _feat_temporal[:, -1]),
             #         r_t, edge_index_t,
             #     )
-                
-            #     # Process map2agent attention
             #     feat_a_now = self.pt2a_attn_layers[i](
             #         (map_feature["pt_token"], feat_a_now), r_pl2a, edge_index_pl2a
             #     )
-                
-            #     # Process agent2agent attention
             #     feat_a_now = self.a2a_attn_layers[i](
             #         feat_a_now, r_a2a, edge_index_a2a
             #     )
@@ -903,7 +897,7 @@ class SMARTAgentDecoder(nn.Module):
         
         # Predict next token
         next_token_logits = self.token_predict_head(feat_a_now)
-        
+
         return {
             'next_token_logits': next_token_logits,
             'feat_a': feat_a,

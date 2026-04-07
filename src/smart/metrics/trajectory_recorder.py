@@ -144,7 +144,7 @@ class TrajectoryRecorder(Metric):
             else:
                 converted_agent = agent
             converted_agent_id.append(converted_agent)
-        self.agent_id.append(converted_converted_agent_id)
+        self.agent_id.append(converted_agent_id)
         
         
         # Store predictions if enabled

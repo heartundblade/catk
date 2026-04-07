@@ -79,6 +79,32 @@ def transform_to_global(
         head_global = head_local + head_now.unsqueeze(1)
     return pos_global, head_global
 
+def transform_to_global_parallel(
+    pos_local_: Tensor,  # [n_parallel, n_agent, n_step, 2]
+    head_local_: Optional[Tensor],  # [n_parallel, n_agent, n_step]
+    pos_now_: Tensor,  # [n_parallel, n_agent, 2]
+    head_now_: Tensor,  # [n_parallel, n_agent]
+) -> Tuple[Tensor, Optional[Tensor]]:
+    cos, sin = head_now_.cos(), head_now_.sin()
+    rot_mat = torch.zeros(
+        (head_now_.shape[0]*head_now_.shape[1], 2, 2), device=head_now_.device
+        )
+    rot_mat[:, 0, 0] = cos
+    rot_mat[:, 0, 1] = sin
+    rot_mat[:, 1, 0] = -sin
+    rot_mat[:, 1, 1] = cos
+
+    pos_global_ = torch.bmm(
+        pos_local_.reshape(-1, pos_local_.shape[2], 2), rot_mat
+        )  # [n_parallel*n_agent, n_step, 2]*[n_agent, 2, 2]
+    pos_global_ = pos_global_.reshape(pos_local_.shape)
+    
+    pos_global_ = pos_global_ + pos_now_.unsqueeze(2)
+    if head_local_ is None:
+        head_global_ = None
+    else:
+        head_global_ = head_local_ + head_now_.unsqueeze(2)
+    return pos_global_, head_global_
 
 def transform_to_local(
     pos_global: Tensor,  # [n_agent, n_step, 2]
@@ -184,6 +210,94 @@ def sample_next_token_traj(
 
     return next_token_idx, next_token_traj_all
 
+def sample_next_token_traj_parallel(
+    token_traj: Tensor,  # [n_agent, n_token, 4, 2]
+    token_traj_all: Tensor,  # [n_agent, n_token, 6, 4, 2]
+    sampling_scheme: DictConfig,
+    # ! for most-likely sampling
+    next_token_logits_: Tensor,  # [n_parallel, n_agent, n_token], with grad
+    # ! for nearest-pos sampling, sampling near to GT
+    pos_now: Tensor,  # [n_parallel, n_agent, 2]
+    head_now: Tensor,  # [n_parallel, n_agent]
+    pos_next_gt: Tensor,  # [n_agent, 2]
+    head_next_gt: Tensor,  # [n_agent]
+    valid_next_gt: Tensor,  # [n_agent]
+    token_agent_shape: Tensor,  # [n_agent, 2]
+) -> Tuple[Tensor, Tensor]:
+    """
+    Returns:
+        next_token_traj_all: [n_agent, 6, 4, 2], local coord
+        next_token_idx: [n_agent], without grad
+    """
+    range_a = torch.arange(next_token_logits_.shape[1])
+    next_token_logits_ = next_token_logits_.detach()
+
+    if (
+        sampling_scheme.criterium == "topk_prob"
+        or sampling_scheme.criterium == "topk_prob_sampled_with_dist"
+    ):
+        topk_logits_, topk_indices_ = torch.topk(
+            next_token_logits_, sampling_scheme.num_k, dim=-1, sorted=False
+        )
+        if sampling_scheme.criterium == "topk_prob_sampled_with_dist":
+            # below is not executed since the criterium is tok_prob in validation step
+            #! gt_contour: [n_agent, 4, 2] in global coord
+            gt_contour = cal_polygon_contour(
+                pos_next_gt, head_next_gt, token_agent_shape
+            )
+            gt_contour = gt_contour.unsqueeze(1)  # [n_agent, 1, 4, 2]
+            token_world_sample = token_traj[range_a.unsqueeze(1), topk_indices_]
+            token_world_sample = transform_to_global(
+                pos_local=token_world_sample.flatten(1, 2),
+                head_local=None,
+                pos_now=pos_now,  # [n_agent, 2]
+                head_now=head_now,  # [n_agent]
+            )[0].view(*token_world_sample.shape)
+
+            # dist: [n_agent, n_token]
+            dist = torch.norm(token_world_sample - gt_contour, dim=-1).mean(-1)
+            topk_logits_ = topk_logits_.masked_fill(
+                valid_next_gt.unsqueeze(1), 0.0
+            ) - 1.0 * dist.masked_fill(~valid_next_gt.unsqueeze(1), 0.0)
+    elif sampling_scheme.criterium == "topk_dist_sampled_with_prob":
+        #! gt_contour: [n_agent, 4, 2] in global coord
+        gt_contour = cal_polygon_contour(pos_next_gt, head_next_gt, token_agent_shape)
+        gt_contour = gt_contour.unsqueeze(1)  # [n_agent, 1, 4, 2]
+        token_world_sample = transform_to_global(
+            pos_local=token_traj.flatten(1, 2),  # [n_agent, n_token*4, 2]
+            head_local=None,
+            pos_now=pos_now,  # [n_agent, 2]
+            head_now=head_now,  # [n_agent]
+        )[0].view(*token_traj.shape)
+
+        _invalid = ~valid_next_gt
+        # dist: [n_agent, n_token]
+        dist = torch.norm(token_world_sample - gt_contour, dim=-1).mean(-1)
+        _logits = -1.0 * dist.masked_fill(_invalid.unsqueeze(1), 0.0)
+
+        if _invalid.any():
+            _logits[_invalid] = next_token_logits_[_invalid]
+        _, topk_indices_ = torch.topk(
+            _logits, sampling_scheme.num_k, dim=-1, sorted=False
+        )  # [n_agent, K]
+        topk_logits_ = next_token_logits_[range_a.unsqueeze(1), topk_indices_]
+
+    else:
+        raise ValueError(f"Invalid criterium: {sampling_scheme.criterium}")
+
+    # topk_logits_, topk_indices_: [n_parallel, n_agent, K]
+    range_a_ = range_a.unsqueeze(0).repeat(
+        next_token_logits_.shape[0], 0
+        )  # [n_parallel, n_agent]
+
+    topk_logits_ = topk_logits_ / sampling_scheme.temp
+    samples = Categorical(logits=topk_logits_).sample()  # [n_parallel, n_agent] in K
+    next_token_idx_ = topk_indices_[range_a_, samples]
+    next_token_traj_all_ = token_traj_all.unsqueeze(0).repeat(
+        next_token_logits_.shape[0], 0
+        )[range_a_, next_token_idx_]
+
+    return next_token_idx_, next_token_traj_all_
 
 def sample_next_gmm_traj(
     token_traj: Tensor,  # [n_agent, n_token, 4, 2]
