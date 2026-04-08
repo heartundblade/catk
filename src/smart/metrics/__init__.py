@@ -19,3 +19,4 @@ from src.smart.metrics.next_token_cls import TokenCls
 from src.smart.metrics.trajectory_recorder import TrajectoryRecorder
 from src.smart.metrics.wosac_metrics import WOSACMetrics
 from src.smart.metrics.wosac_submission import WOSACSubmission
+from src.smart.metrics.fast_wosac_metric import WOSACMetric

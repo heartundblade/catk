@@ -13,6 +13,7 @@ model_config:
   # val_closed_loop: true
   val_closed_loop: true
   parallel_val: false
+  fast_wosac_metric: true
   token_processor:
     map_token_file: "map_traj_token5.pkl"
     agent_token_file: "agent_vocab_555_s2.pkl"

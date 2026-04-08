@@ -26,6 +26,7 @@ from src.smart.metrics import (
     WOSACMetrics,
     WOSACSubmission,
     minADE,
+    WOSACMetric,
 )
 from src.smart.modules.smart_decoder import SMARTDecoder
 from src.smart.tokens.token_processor import TokenProcessor
@@ -57,7 +58,10 @@ class SMART(LightningModule):
 
         self.minADE = minADE()
         self.TokenCls = TokenCls(max_guesses=5)
-        self.wosac_metrics = WOSACMetrics("val_closed")
+        if model_config.fast_wosac_metric:
+            self.wosac_metrics = WOSACMetric()
+        else:
+            self.wosac_metrics = WOSACMetrics("val_closed")
         self.wosac_submission = WOSACSubmission(**model_config.wosac_submission)
         self.trajectory_recorder = TrajectoryRecorder(**model_config.trajectory_recorder)
         self.training_loss = CrossEntropy(**model_config.training_loss)
