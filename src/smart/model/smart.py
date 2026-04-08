@@ -282,7 +282,7 @@ class SMART(LightningModule):
             # pred_z = torch.stack(pred_z, dim=1)  # [n_ag, n_rollout, n_step]
             # pred_head = torch.stack(pred_head, dim=1)  # [n_ag, n_rollout, n_step]
 
-            pred = self.encoder.parallel_inference(
+            pred = self.encoder.inference(
                     tokenized_map, tokenized_agent, self.validation_rollout_sampling
                 )
             pred_traj = pred["pred_traj_10hz"].transpose(0, 1)  # [n_ag, n_rollout, n_step, 2]

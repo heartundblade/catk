@@ -149,54 +149,95 @@ class ParSMARTAgentDecoder(SMARTAgentDecoder):
     
     def batch_build_temporal_edge(
         self,
-        pos_a,  # [n_parallel, n_agent, n_step, 2]
-        head_a,  # [n_parallel, n_agent, n_step]
-        head_vector_a,  # [n_parallel, n_agent, n_step, 2]
-        mask,  # [n_parallel, n_agent, n_step]
-        inference_mask=None,  # [n_parallel, n_agent, n_step]
+        pos_a_,  # [n_parallel, n_agent, n_step, 2]
+        head_a_,  # [n_parallel, n_agent, n_step]
+        head_vector_a_,  # [n_parallel, n_agent, n_step, 2]
+        mask_,  # [n_parallel, n_agent, n_step]
+        inference_mask_=None,  # [n_parallel, n_agent, n_step]
     ):
         """
         Batch version of temporal edge construction
         """
-        pos_t = pos_a.flatten(1, 2)
-        head_t = head_a.flatten(1, 2)
-        head_vector_t = head_vector_a.flatten(1, 2)
+        pos_t_ = pos_a_.flatten(1, 2)
+        head_t_ = head_a_.flatten(1, 2)
+        head_vector_t_ = head_vector_a_.flatten(1, 2)
 
         if self.hist_drop_prob > 0 and self.training:
-            _mask_keep = torch.bernoulli(
-                torch.ones_like(mask) * (1 - self.hist_drop_prob)
+            _mask_keep_ = torch.bernoulli(
+                torch.ones_like(mask_) * (1 - self.hist_drop_prob)
             ).bool()
-            mask = mask & _mask_keep
+            mask_ = mask_ & _mask_keep_
         
-        if inference_mask is not None:
-            mask_t = mask.unsqueeze(3) & inference_mask.unsqueeze(2)
+        if inference_mask_ is not None:
+            mask_t_ = mask_.unsqueeze(3) & inference_mask_.unsqueeze(2)
         else:
-            mask_t = mask.unsqueeze(3) & mask.unsqueeze(2)
+            mask_t_ = mask_.unsqueeze(3) & mask_.unsqueeze(2)
         
-        edge_index_t = dense_to_sparse(mask_t)[0]  # [num_edge, 2]
-        edge_index_t = edge_index_t[:, edge_index_t[:, 1] > edge_index_t[:, 0]]
-        edge_index_t = edge_index_t[
-            :, edge_index_t[:, 1] - edge_index_t[:, 0] <= self.time_span / self.shift
-        ]
+        n_parallel = mask_t_.shape[0]
+        all_edge_index_t = []
+        all_r_t = []
 
-        rel_pos_t = pos_t[edge_index_t[:, 0]] - pos_t[edge_index_t[:, 1]]
-        rel_pos_t = rel_pos_t[:, :, :2]
-        rel_head_t = wrap_angle(
-            head_t[edge_index_t[:, 0]] - head_t[edge_index_t[:, 1]]
+        for i in range(n_parallel):
+            mask_t = mask_t_[i]
+            pos_t = pos_t_[i]
+            head_t = head_t_[i]
+            head_vector_t = head_vector_t_[i]
+            
+            edge_index_t = dense_to_sparse(mask_t)[0]  # [2, num_edge]
+            # print(edge_index_t.shape, mask_t.shape, i)
+            edge_index_t = edge_index_t[:, edge_index_t[1] > edge_index_t[0]]
+            edge_index_t = edge_index_t[
+                :, edge_index_t[1] - edge_index_t[0] <= self.time_span / self.shift
+            ]
+
+            rel_pos_t = pos_t[edge_index_t[0]] - pos_t[edge_index_t[1]]
+            rel_pos_t = rel_pos_t[:, :2]
+            rel_head_t = wrap_angle(
+                head_t[edge_index_t[0]] - head_t[edge_index_t[1]]
+                )
+            r_t = torch.stack(
+                [
+                    torch.norm(rel_pos_t, p=2, dim=-1),
+                    angle_between_2d_vectors(
+                        ctr_vector=head_vector_t[edge_index_t[1]], nbr_vector=rel_pos_t
+                    ),
+                    rel_head_t,
+                    edge_index_t[0] - edge_index_t[1],
+                ],
+                dim=-1,
             )
-        r_t = torch.stack(
-            [
-                torch.norm(rel_pos_t, p=2, dim=-1),
-                angle_between_2d_vectors(
-                    ctr_vector=head_vector_t[edge_index_t[:, 1]], nbr_vector=rel_pos_t
-                ),
-                rel_head_t,
-                edge_index_t[:, 0] - edge_index_t[:, 1],
-            ],
-            dim=-1,
-        )
-        r_t = self.r_t_emb(continuous_inputs=r_t, categorical_embs=None)
-        return edge_index_t, r_t
+            all_edge_index_t.append(edge_index_t)
+            all_r_t.append(r_t)
+        
+        edge_index_t_ = torch.cat(all_edge_index_t, dim=1)
+        r_t_ = torch.cat(all_r_t, dim=0)
+
+        r_t_ = self.r_t_emb(continuous_inputs=r_t_, categorical_embs=None)
+
+        # edge_index_t = dense_to_sparse(mask_t)[0]  # [num_edge, 2]
+        # edge_index_t = edge_index_t[:, edge_index_t[:, 1] > edge_index_t[:, 0]]
+        # edge_index_t = edge_index_t[
+        #     :, edge_index_t[:, 1] - edge_index_t[:, 0] <= self.time_span / self.shift
+        # ]
+
+        # rel_pos_t = pos_t[edge_index_t[:, 0]] - pos_t[edge_index_t[:, 1]]
+        # rel_pos_t = rel_pos_t[:, :, :2]
+        # rel_head_t = wrap_angle(
+        #     head_t[edge_index_t[:, 0]] - head_t[edge_index_t[:, 1]]
+        #     )
+        # r_t = torch.stack(
+        #     [
+        #         torch.norm(rel_pos_t, p=2, dim=-1),
+        #         angle_between_2d_vectors(
+        #             ctr_vector=head_vector_t[edge_index_t[:, 1]], nbr_vector=rel_pos_t
+        #         ),
+        #         rel_head_t,
+        #         edge_index_t[:, 0] - edge_index_t[:, 1],
+        #     ],
+        #     dim=-1,
+        # )
+        # r_t = self.r_t_emb(continuous_inputs=r_t, categorical_embs=None)
+        return edge_index_t_, r_t_
     
     def batch_build_interaction_edge(
         self,
@@ -214,29 +255,64 @@ class ParSMARTAgentDecoder(SMARTAgentDecoder):
         pos_s_ = pos_a_.transpose(1, 2).flatten(1, 2)  # [n_parallel, n_agent*n_step, 2]
         head_s_ = head_a_.transpose(1, 2).reshape(n_parallel, -1)  # [n_parallel, n_agent*n_step]
         head_vector_s_ = head_vector_a_.transpose(1, 2).reshape(n_parallel, -1, 2)  # [n_parallel, n_agent*n_step, 2]
-        edge_index_a2a_ = radius_graph(
-            x=pos_s_[:, :, :2],
-            r=self.a2a_radius,
-            batch=batch_s_,
-            loop = False,
-            max_num_neighbors=300,
-        )
-        edge_index_a2a_ = subgraph(subset=mask_, edge_index=edge_index_a2a_)[0]
-        rel_pos_a2a_ = pos_s_[:, edge_index_a2a_[0]] - pos_s_[:, edge_index_a2a_[1]]
-        rel_head_a2a_ = wrap_angle(
-            head_s_[:, edge_index_a2a_[0]] - head_s_[:, edge_index_a2a_[1]]
-        )
-        r_a2a_ = torch.stack(
-            [
-                torch.norm(rel_pos_a2a_, p=2, dim=-1),
-                angle_between_2d_vectors(
-                    ctr_vector=head_vector_s_[edge_index_a2a_[1]], nbr_vector=rel_pos_a2a_
-                ),
-                rel_head_a2a_,
-            ],
-            dim=-1,
-        )
+
+        all_edge_index_a2a = []
+        all_r_a2a = []
+        for i in range(n_parallel):
+            edge_index_a2a = radius_graph(
+                x=pos_s_[i, :, :2],
+                r=self.a2a_radius,
+                batch=batch_s_[i],
+                loop = False,
+                max_num_neighbors=300,
+            )
+            edge_index_a2a = subgraph(subset=mask_[i], edge_index=edge_index_a2a)[0]
+            rel_pos_a2a = pos_s_[i, edge_index_a2a[0]] - pos_s_[i, edge_index_a2a[1]]
+            rel_head_a2a = wrap_angle(
+                head_s_[i, edge_index_a2a[0]] - head_s_[i, edge_index_a2a[1]]
+            )
+            r_a2a = torch.stack(
+                [
+                    torch.norm(rel_pos_a2a[:, :2], p=2, dim=-1),
+                    angle_between_2d_vectors(
+                        ctr_vector=head_vector_s_[i, edge_index_a2a[1]], 
+                        nbr_vector=rel_pos_a2a[:, :2]
+                    ),
+                    rel_head_a2a,
+                ],
+                dim=-1,
+            )
+            all_edge_index_a2a.append(edge_index_a2a)
+            all_r_a2a.append(r_a2a)
+        
+        edge_index_a2a_ = torch.cat(all_edge_index_a2a, dim=1)
+        r_a2a_ = torch.cat(all_r_a2a, dim=0)
+
         r_a2a_ = self.r_a2a_emb(continuous_inputs=r_a2a_, categorical_embs=None)
+
+        # edge_index_a2a_ = radius_graph(
+        #     x=pos_s_[:, :, :2],
+        #     r=self.a2a_radius,
+        #     batch=batch_s_,
+        #     loop = False,
+        #     max_num_neighbors=300,
+        # )
+        # edge_index_a2a_ = subgraph(subset=mask_, edge_index=edge_index_a2a_)[0]
+        # rel_pos_a2a_ = pos_s_[:, edge_index_a2a_[0]] - pos_s_[:, edge_index_a2a_[1]]
+        # rel_head_a2a_ = wrap_angle(
+        #     head_s_[:, edge_index_a2a_[0]] - head_s_[:, edge_index_a2a_[1]]
+        # )
+        # r_a2a_ = torch.stack(
+        #     [
+        #         torch.norm(rel_pos_a2a_, p=2, dim=-1),
+        #         angle_between_2d_vectors(
+        #             ctr_vector=head_vector_s_[edge_index_a2a_[1]], nbr_vector=rel_pos_a2a_
+        #         ),
+        #         rel_head_a2a_,
+        #     ],
+        #     dim=-1,
+        # )
+        # r_a2a_ = self.r_a2a_emb(continuous_inputs=r_a2a_, categorical_embs=None)
         return edge_index_a2a_, r_a2a_
     
     def batch_build_map2agent_edge(
@@ -262,34 +338,69 @@ class ParSMARTAgentDecoder(SMARTAgentDecoder):
         pos_pl_ = pos_pl.unsqueeze(0).repeat(n_parallel, n_step, 1)  # [n_parallel, n_pl*n_step, 2]
         orient_pl_ = orient_pl.unsqueeze(0).repeat(n_parallel, n_step)  # [n_parallel, n_pl*n_step]
         
-        edge_index_pl2a_ = radius(
-            x=pos_s_[:, :, :2],
-            y=pos_pl_[:, :, :2],
-            r=self.pl2a_radius,
-            batch_x=batch_s_,
-            batch_y=batch_pl_,
-            max_num_neighbors=300,
-        )
-        edge_index_pl2a_ = edge_index_pl2a_[:, mask_pl2a_[:, edge_index_pl2a_[:, 1]]]
-        rel_pos_pl2a_ = pos_pl_[:, edge_index_pl2a_[:, 0]] - pos_s_[:, edge_index_pl2a_[:, 1]]
-        rel_orient_pl2a_ = wrap_angle(
-            orient_pl_[:, edge_index_pl2a_[:, 0]] - head_s_[:, edge_index_pl2a_[:, 1]]
-        )
-        r_pl2a_ = torch.stack(
-            [
-                torch.norm(rel_pos_pl2a_[:, :, :2], p=2, dim=-1),
-                angle_between_2d_vectors(
-                    ctr_vector=head_vector_s_[edge_index_pl2a_[:, 1]], nbr_vector=rel_pos_pl2a_
-                ),
-                rel_orient_pl2a_,
-            ],
-            dim=-1,
-        )
+        all_edge_index_pl2a = []
+        all_r_pl2a = []
+        for i in range(n_parallel):
+            edge_index_pl2a = radius(
+                x=pos_s_[i, :, :2],
+                y=pos_pl_[i, :, :2],
+                r=self.pl2a_radius,
+                batch_x=batch_s_[i],
+                batch_y=batch_pl_[i],
+                max_num_neighbors=300,
+            )
+            edge_index_pl2a = edge_index_pl2a[:, mask_pl2a_[i, edge_index_pl2a[1]]]
+            rel_pos_pl2a = pos_pl_[i, edge_index_pl2a[0]] - pos_s_[i, edge_index_pl2a[1]]
+            rel_orient_pl2a = wrap_angle(
+                orient_pl_[i, edge_index_pl2a[0]] - head_s_[i, edge_index_pl2a[1]]
+            )
+            r_pl2a = torch.stack(
+                [
+                    torch.norm(rel_pos_pl2a[:, :2], p=2, dim=-1),
+                    angle_between_2d_vectors(
+                        ctr_vector=head_vector_s_[i, edge_index_pl2a[1]], 
+                        nbr_vector=rel_pos_pl2a[:, :2]
+                    ),
+                    rel_orient_pl2a,
+                ],
+                dim=-1,
+            )
+            all_edge_index_pl2a.append(edge_index_pl2a)
+            all_r_pl2a.append(r_pl2a)
+
+        edge_index_pl2a_ = torch.cat(all_edge_index_pl2a, dim=1)
+        r_pl2a_ = torch.cat(all_r_pl2a, dim=0)
+
         r_pl2a_ = self.r_pt2a_emb(continuous_inputs=r_pl2a_, categorical_embs=None)
+
+        # edge_index_pl2a_ = radius(
+        #     x=pos_s_[:, :, :2],
+        #     y=pos_pl_[:, :, :2],
+        #     r=self.pl2a_radius,
+        #     batch_x=batch_s_,
+        #     batch_y=batch_pl_,
+        #     max_num_neighbors=300,
+        # )
+        # edge_index_pl2a_ = edge_index_pl2a_[:, mask_pl2a_[:, edge_index_pl2a_[:, 1]]]
+        # rel_pos_pl2a_ = pos_pl_[:, edge_index_pl2a_[:, 0]] - pos_s_[:, edge_index_pl2a_[:, 1]]
+        # rel_orient_pl2a_ = wrap_angle(
+        #     orient_pl_[:, edge_index_pl2a_[:, 0]] - head_s_[:, edge_index_pl2a_[:, 1]]
+        # )
+        # r_pl2a_ = torch.stack(
+        #     [
+        #         torch.norm(rel_pos_pl2a_[:, :, :2], p=2, dim=-1),
+        #         angle_between_2d_vectors(
+        #             ctr_vector=head_vector_s_[edge_index_pl2a_[:, 1]], nbr_vector=rel_pos_pl2a_
+        #         ),
+        #         rel_orient_pl2a_,
+        #     ],
+        #     dim=-1,
+        # )
+        # r_pl2a_ = self.r_pt2a_emb(continuous_inputs=r_pl2a_, categorical_embs=None)
         
         return edge_index_pl2a_, r_pl2a_
     
-    def parallel_inference(
+    def inference(
         self,
         tokenized_agent: Dict[str, torch.Tensor],
         map_feature: Dict[str, torch.Tensor],
@@ -316,19 +427,18 @@ class ParSMARTAgentDecoder(SMARTAgentDecoder):
         head_vector_a = torch.stack([head_a.cos(), head_a.sin()], dim=-1)  # [n_agent, n_step, 2]
         pred_idx = tokenized_agent["gt_idx"].clone()
 
-        # expand may cause numerical issue
-        pos_a_ = pos_a.unsqueeze(0).expand(
-            self.n_parallel, -1, -1, -1
+        pos_a_ = pos_a.unsqueeze(0).repeat(
+            self.n_parallel, 1, 1, 1
             )  # [n_parallel, n_agent, n_step, 2]
-        head_a_ = head_a.unsqueeze(0).expand(
-            self.n_parallel, -1, -1
+        head_a_ = head_a.unsqueeze(0).repeat(
+            self.n_parallel, 1, 1
             )  # [n_parallel, n_agent, n_step]
-        head_vector_a_ = head_vector_a.unsqueeze(0).expand(
-            self.n_parallel, -1, -1, -1
+        head_vector_a_ = head_vector_a.unsqueeze(0).repeat(
+            self.n_parallel, 1, 1, 1
             )  # [n_parallel, n_agent, n_step, 2]
-        pred_idx_ = pred_idx.unsqueeze(0).expand(
-            self.n_parallel, -1
-            )  # [n_parallel, n_agent]
+        pred_idx_ = pred_idx.unsqueeze(0).repeat(
+            self.n_parallel, 1, 1
+            )  # [n_parallel, n_agent, n_step]
         
         device = tokenized_agent["valid_mask"].device
         (
@@ -353,33 +463,33 @@ class ParSMARTAgentDecoder(SMARTAgentDecoder):
             inference=True,
         )
 
-        agent_token_emb_ = agent_token_emb.unsqueeze(0).expand(
-            self.n_parallel, -1, -1
+        agent_token_emb_ = agent_token_emb.unsqueeze(0).repeat(
+            self.n_parallel, 1, 1, 1
             )  # [n_parallel, n_agent, step_current_2hz, hidden_dim]
-        agent_token_emb_veh_ = agent_token_emb_veh.unsqueeze(0).expand(
-            self.n_parallel, -1
+        agent_token_emb_veh_ = agent_token_emb_veh.unsqueeze(0).repeat(
+            self.n_parallel, 1, 1
             )  # [n_parallel, n_agent, hidden_dim]
-        agent_token_emb_ped_ = agent_token_emb_ped.unsqueeze(0).expand(
-            self.n_parallel, -1
+        agent_token_emb_ped_ = agent_token_emb_ped.unsqueeze(0).repeat(
+            self.n_parallel, 1, 1
             )  # [n_parallel, n_agent, hidden_dim]
-        agent_token_emb_cyc_ = agent_token_emb_cyc.unsqueeze(0).expand(
-            self.n_parallel, -1
+        agent_token_emb_cyc_ = agent_token_emb_cyc.unsqueeze(0).repeat(
+            self.n_parallel, 1, 1
             )  # [n_parallel, n_agent, hidden_dim]
-        veh_mask_ = veh_mask.unsqueeze(0).expand(
-            self.n_parallel, -1
+        veh_mask_ = veh_mask.unsqueeze(0).repeat(
+            self.n_parallel, 1
             )  # [n_parallel, n_agent]
-        ped_mask_ = ped_mask.unsqueeze(0).expand(
-            self.n_parallel, -1
+        ped_mask_ = ped_mask.unsqueeze(0).repeat(
+            self.n_parallel, 1
             )  # [n_parallel, n_agent]
-        cyc_mask_ = cyc_mask.unsqueeze(0).expand(
-            self.n_parallel, -1
+        cyc_mask_ = cyc_mask.unsqueeze(0).repeat(
+            self.n_parallel, 1
             )  # [n_parallel, n_agent]
-        categorical_embs_ = [emb.unsqueeze(0).expand(
-            self.n_parallel, -1
+        categorical_embs_ = [emb.unsqueeze(0).repeat(
+            self.n_parallel, 1, 1
             ) for emb in categorical_embs]  # [n_parallel, n_agent, hidden_dim]
 
-        feat_a_ = feat_a.unsqueeze(0).expand(
-            self.n_parallel, -1, -1, -1
+        feat_a_ = feat_a.unsqueeze(0).repeat(
+            self.n_parallel, 1, 1, 1
             )  # [n_parallel, n_agent, step_current_2hz, hidden_dim]
 
         if not self.training:
@@ -393,13 +503,13 @@ class ParSMARTAgentDecoder(SMARTAgentDecoder):
             )
         
         pred_valid = tokenized_agent["valid_mask"].clone()
-        pred_valid_ = pred_valid.unsqueeze(0).expand(self.n_parallel, -1, -1)  # [n_parallel, n_agent, n_step]
+        pred_valid_ = pred_valid.unsqueeze(0).repeat(self.n_parallel, 1, 1)  # [n_parallel, n_agent, n_step]
         next_token_logits_list = []
         next_token_action_list = []
         feat_a_t_dict_ = {}
 
         for t in range(n_step_future_2hz):  # 0 -> 15
-            t_now = step_current_2hz + t  # 1 -> 16
+            t_now = step_current_2hz - 1 + t  # 1 -> 16
             n_step = t_now + 1  # 2 -> 17
 
             if t == 0:
@@ -416,51 +526,49 @@ class ParSMARTAgentDecoder(SMARTAgentDecoder):
                         for t in range(hist_step)
                     ], dim=0
                 )  # [n_pl*hist_step]
-                inference_mask = pred_valid_[:, :, :n_step]  # [n_parallel, n_agent, n_step]
                 
-                batch_s_ = batch_s.unsqueeze(0).expand(self.n_parallel, -1)  # [n_parallel, n_agent*hist_step]
-                batch_pl_ = batch_pl.unsqueeze(0).expand(self.n_parallel, -1)  # [n_parallel, n_pl*hist_step]
-                inference_mask_ = inference_mask.unsqueeze(0).expand(self.n_parallel, -1)  # [n_parallel, n_agent, n_step]
+                batch_s_ = batch_s.unsqueeze(0).repeat(self.n_parallel, 1)  # [n_parallel, n_agent*hist_step]
+                batch_pl_ = batch_pl.unsqueeze(0).repeat(self.n_parallel, 1)  # [n_parallel, n_pl*hist_step]
+                inference_mask_ = pred_valid_[:, :, :n_step]  # [n_parallel, n_agent, n_step]
 
                 edge_index_t_, r_t_ = self.batch_build_temporal_edge(
-                    pos_a=pos_a_,
-                    head_a=head_a_,
-                    head_vector_a=head_vector_a_,
-                    mask=pred_valid_[:, :, :n_step],
+                    pos_a_=pos_a_,
+                    head_a_=head_a_,
+                    head_vector_a_=head_vector_a_,
+                    mask_=pred_valid_[:, :, :n_step],
                 )
             else:
                 hist_step = 1
-                batch_s_ = tokenized_agent["batch"].unsqueeze(0).expand(self.n_parallel, -1)  # [n_parallel, n_agent*hist_step]
-                batch_pl_ = map_feature["batch"].unsqueeze(0).expand(self.n_parallel, -1)  # [n_parallel, n_pl*hist_step]
-                inference_mask = pred_valid_[:, :, :n_step].clone()  # [n_parallel, n_agent, n_step]
-                inference_mask[:, :-1] = False  # Only keep the last step for inference
-                inference_mask_ = inference_mask.unsqueeze(0).expand(self.n_parallel, -1)  # [n_parallel, n_agent, n_step]
+                batch_s_ = tokenized_agent["batch"].unsqueeze(0).repeat(self.n_parallel, 1)  # [n_parallel, n_agent*hist_step]
+                batch_pl_ = map_feature["batch"].unsqueeze(0).repeat(self.n_parallel, 1)  # [n_parallel, n_pl*hist_step]
+                inference_mask_ = pred_valid_[:, :, :n_step].clone()  # [n_parallel, n_agent, n_step]
+                inference_mask_[:, :, :-1] = False  # Only keep the last step for inference
                 
                 edge_index_t_, r_t_ = self.batch_build_temporal_edge(
-                    pos_a=pos_a_,
-                    head_a=head_a_,
-                    head_vector_a=head_vector_a_,
-                    mask=pred_valid_[:, :, :n_step],
-                    inference_mask=inference_mask_,
+                    pos_a_=pos_a_,
+                    head_a_=head_a_,
+                    head_vector_a_=head_vector_a_,
+                    mask_=pred_valid_[:, :, :n_step],
+                    inference_mask_=inference_mask_,
                 )
                 edge_index_t_[:, 1] = (edge_index_t_[:, 1] + 1) // n_step - 1
 
             edge_index_pl2a_, r_pl2a_ = self.batch_build_map2agent_edge(
                 pos_pl=map_feature["position"],  # [n_pl, 2]
                 orient_pl=map_feature["orientation"],  # [n_pl]
-                pos_a=pos_a_[:, :, -hist_step:],  # [n_parallel, n_agent, hist_step, 2]
-                head_a=head_a_[:, :, -hist_step:],  # [n_parallel, n_agent, hist_step]
-                head_vector_a=head_vector_a_[:, :, -hist_step:],  # [n_parallel, n_agent, hist_step, 2]
-                mask=inference_mask_[:, :, -hist_step:],  # [n_parallel, n_agent, hist_step]
-                batch_s=batch_s_,  # [n_parallel, n_agent*hist_step]
-                batch_pl=batch_pl_,  # [n_parallel, n_pl*hist_step]
+                pos_a_=pos_a_[:, :, -hist_step:],  # [n_parallel, n_agent, hist_step, 2]
+                head_a_=head_a_[:, :, -hist_step:],  # [n_parallel, n_agent, hist_step]
+                head_vector_a_=head_vector_a_[:, :, -hist_step:],  # [n_parallel, n_agent, hist_step, 2]
+                mask_=inference_mask_[:, :, -hist_step:],  # [n_parallel, n_agent, hist_step]
+                batch_s_=batch_s_,  # [n_parallel, n_agent*hist_step]
+                batch_pl_=batch_pl_,  # [n_parallel, n_pl*hist_step]
             )
             edge_index_a2a_, r_a2a_ = self.batch_build_interaction_edge(
-                pos_a=pos_a_[:, :, -hist_step:],  # [n_parallel, n_agent, hist_step, 2]
-                head_a=head_a_[:, :, -hist_step:],  # [n_parallel, n_agent, hist_step]
-                head_vector_a=head_vector_a_[:, :, -hist_step:],  # [n_parallel, n_agent, hist_step, 2]
-                batch_s=batch_s_,  # [n_parallel, n_agent*hist_step]
-                mask=inference_mask_[:, :, -hist_step:],  # [n_parallel, n_agent, hist_step]
+                pos_a_=pos_a_[:, :, -hist_step:],  # [n_parallel, n_agent, hist_step, 2]
+                head_a_=head_a_[:, :, -hist_step:],  # [n_parallel, n_agent, hist_step]
+                head_vector_a_=head_vector_a_[:, :, -hist_step:],  # [n_parallel, n_agent, hist_step, 2]
+                batch_s_=batch_s_,  # [n_parallel, n_agent*hist_step]
+                mask_=inference_mask_[:, :, -hist_step:],  # [n_parallel, n_agent, hist_step]
             )
 
             # attention layers
@@ -479,9 +587,9 @@ class ParSMARTAgentDecoder(SMARTAgentDecoder):
                     _feat_map_ = (
                         map_feature["pt_token"]
                         .unsqueeze(0)
-                        .expand(hist_step, -1, -1)
+                        .repeat(hist_step, 1, 1)
                         .flatten(0, 1)
-                    ).unsqueeze(0).expand(self.n_parallel, -1, -1)  # [n_parallel, n_pl*hist_step, hidden_dim]
+                    ).unsqueeze(0).repeat(self.n_parallel, 1, 1)  # [n_parallel, n_pl*hist_step, hidden_dim]
                     
                     # Process map2agent attention
                     _feat_temporal_ = self.pt2a_attn_layers[i](
@@ -640,7 +748,7 @@ class ParSMARTAgentDecoder(SMARTAgentDecoder):
             out_dict["pred_traj_10hz"] = pred_traj_10hz_
             out_dict["pred_head_10hz"] = pred_head_10hz_
             pred_z = tokenized_agent["gt_z_raw"].unsqueeze(1)  # [n_agent, 1]
-            out_dict["pred_z_10hz"] = pred_z.expand(-1, pred_traj_10hz_.shape[2])
+            out_dict["pred_z_10hz"] = pred_z.repeat(1, pred_traj_10hz_.shape[2])
         
         return out_dict
 
@@ -770,7 +878,7 @@ class ParSMARTAgentDecoder(SMARTAgentDecoder):
             _feat_temporal = _feat_temporal.transpose(0, 1).flatten(0, 1)
             
             # Expand map features
-            _feat_map = map_feature["pt_token"].unsqueeze(0).expand(hist_step, -1, -1).flatten(0, 1)
+            _feat_map = map_feature["pt_token"].unsqueeze(0).repeat(hist_step, 1, 1).flatten(0, 1)
             
             # Process map2agent attention
             _feat_temporal = self.pt2a_attn_layers[i](
