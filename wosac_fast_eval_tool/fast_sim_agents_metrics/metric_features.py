@@ -10,7 +10,7 @@ from . import interaction_features
 from . import map_metric_features
 from . import trajectory_features
 from . import traffic_light_features
-_ChallengeType = submission_specs.ChallengeType
+# _ChallengeType = submission_specs.ChallengeType
 _LaneType = map_pb2.LaneCenter.LaneType
 import time
 _distance_computation_total_time = 0.0

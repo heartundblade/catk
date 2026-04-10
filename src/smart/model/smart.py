@@ -59,7 +59,7 @@ class SMART(LightningModule):
         self.minADE = minADE()
         self.TokenCls = TokenCls(max_guesses=5)
         if model_config.fast_wosac_metric:
-            self.wosac_metrics = WOSACMetric()
+            self.wosac_metrics = WOSACMetric('2024')
         else:
             self.wosac_metrics = WOSACMetrics("val_closed")
         self.wosac_submission = WOSACSubmission(**model_config.wosac_submission)
@@ -146,6 +146,15 @@ class SMART(LightningModule):
             pred_z = torch.stack(pred_z, dim=1)  # [n_ag, n_rollout, n_step]
             pred_head = torch.stack(pred_head, dim=1)  # [n_ag, n_rollout, n_step]
 
+            simulated_states = torch.cat(
+                [
+                    pred_traj.transpose(0, 1),
+                    pred_z.transpose(0, 1).unsqueeze(-1),
+                    pred_head.transpose(0, 1).unsqueeze(-1)
+                ],
+                dim=-1
+            )  # [n_rollout, n_ag, n_step, 4]
+
             # ! WOSAC
             scenario_rollouts = None
             
@@ -173,7 +182,16 @@ class SMART(LightningModule):
                     pred_z=pred_z,
                     pred_head=pred_head,
                 )
-                self.wosac_metrics.update(data["tfrecord_path"], scenario_rollouts)
+                if isinstance(self.wosac_metrics, WOSACMetric):
+                    self.wosac_metrics.update(
+                    scenario_id=data["scenario_id"],
+                    gt_scenarios=data["gt_scenario"],
+                    agent_id=data["agent"]["id"],
+                    agent_batch=data["agent"]["batch"],
+                    simulated_states=simulated_states,
+                )
+                else:
+                    self.wosac_metrics.update(data["tfrecord_path"], scenario_rollouts)
             
             # Record trajectories - after metrics are updated
             if self.trajectory_recorder.is_active:

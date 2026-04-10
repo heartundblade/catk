@@ -23,7 +23,7 @@ _METRIC_FIELD_NAMES_BY_BUCKET = {
     ],
     'map_based': [
             'distance_to_road_edge', 'offroad_indication',
-            'traffic_light_violation',
+            # 'traffic_light_violation',
     ]
 }
 _METRIC_FIELD_NAMES = (
