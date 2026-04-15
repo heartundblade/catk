@@ -15,6 +15,7 @@ from typing import Any, Dict
 
 import numpy as np
 import torch
+import math
 from scipy.interpolate import interp1d
 
 
@@ -175,3 +176,44 @@ def preprocess_map(map_data: Dict[str, Any]) -> Dict[str, Any]:
             "num_nodes": data["map_save"]["traj_pos"].shape[0],
         }
     return data
+
+def wrap_angle(
+    angle: torch.Tensor, min_val: float = -math.pi, max_val: float = math.pi
+) -> torch.Tensor:
+    return min_val + (angle + max_val) % (max_val - min_val)
+
+def wrap_to_pi(angle):
+    """
+    Wrap an angle to the range [-pi, pi].
+
+    Args:
+        angle (float): The input angle.
+
+    Returns:
+        float: The wrapped angle.
+    """
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+def data_collate_fn(batch_list):
+    """
+    Collects a batch of data from a list of transitions.
+
+    Args:
+        batch_list (List): a list of transitions.
+
+    Returns:
+        Dict[str, torch.Tensor]: a batch of data.
+    """
+    list_len = len(batch_list)
+    key_to_list = {}
+    for key in batch_list[0].keys():
+        key_to_list[key] = [batch_list[i][key] for i in range(list_len)]
+
+    input_batch = {}
+    for key, value in key_to_list.items():
+        if 'scenario' not in key:
+            input_batch[key] = torch.from_numpy(np.stack(value, axis=0))
+        else:
+            input_batch[key] = value
+
+    return input_batch

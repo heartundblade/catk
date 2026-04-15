@@ -216,7 +216,7 @@ class MapEncoder(nn.Module):
         self.traffic_light_embed = nn.Embedding(8, 256)
         self.type_embed = nn.Embedding(21, 256, padding_idx=0)
 
-    def forward(self, inputs):
+    def forward(self, inputs: torch.Tensor):
         # inputs [B, M, W, 5]
         output = self.point(inputs[..., :3]) 
         output = torch.max(output, dim=-2).values # max pooling on W
