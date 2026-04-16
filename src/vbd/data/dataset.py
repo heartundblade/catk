@@ -251,133 +251,87 @@ class WaymaxTestDataset(WaymaxDataset):
         return data_dict
 
 
-
-class SmartToVBDDataset(Dataset):
-    def __init__(self, smart_data_dir, max_num_objects=64, max_polylines=256, num_points_polyline=30, current_index=10):
+class VBDDataset(Dataset):
+    def __init__(
+            self, 
+            vbd_data_dir, 
+            anchor_path = "data/cluster_64_center_dict.pkl",
+        ):
         """
         Data class for transforming smart data to vbd input format.
         
         Args:
-            smart_data_dir: Smart processed data directory
-            max_num_objects: Maximum number of objects in the scene
-            max_polylines: Maximum number of polylines in the scene
-            num_points_polyline: Number of points on each polyline
-            current_index: Current time index
+            vbd_data_dir: VBD processed data directory
         """
-        self.smart_data_dir = smart_data_dir
-        self.file_list = [f for f in os.listdir(smart_data_dir) if f.endswith('.pkl')]
-        self.max_num_objects = max_num_objects
-        self.max_polylines = max_polylines
-        self.num_points_polyline = num_points_polyline
-        self.current_index = current_index
+        self.vbd_data_dir = vbd_data_dir
+        self.file_list = glob.glob(vbd_data_dir+'/*') if vbd_data_dir is not None else []
+
+        self.anchors = pickle.load(open(anchor_path, "rb"))
+        
+        self.__collate_fn__ = data_collate_fn
     
     def __len__(self):
         return len(self.file_list)
     
     def __getitem__(self, idx):
-        file_path = os.path.join(self.smart_data_dir, self.file_list[idx])
-        with open(file_path, 'rb') as f:
-            smart_data = pickle.load(f)
-        
-        vbd_input = self.smart_to_vbd_input(smart_data)
-        return vbd_input
+        with open(self.file_list[idx], 'rb') as f:
+            data = pickle.load(f)
+        return self.convert_to_tensor(data)
     
-    def smart_to_vbd_input(self, smart_data):
+    def _process(self, types):
         """
-        Convert Smart processed data to VBD input format.
-        
+        Process the agent types and convert them into anchor vectors.
+
         Args:
-            smart_data: Smart processed data.
-        
+            types (numpy.ndarray): Array of agent types.
+
         Returns:
-            vbd_input: VBD input data.
+            numpy.ndarray: Array of anchor vectors.
         """
-        agent_data = smart_data["agent"]
-        num_agents = agent_data["num_nodes"]
-        
-        agents_history = np.zeros((self.max_num_objects, self.current_index + 1, 8), dtype=np.float32)
-        agents_future = np.zeros((self.max_num_objects, 91 - self.current_index, 5), dtype=np.float32)
-        agents_interested = np.zeros((self.max_num_objects,), dtype=np.int32)
-        agents_type = np.zeros((self.max_num_objects,), dtype=np.int32)
-        agents_id = np.zeros(self.max_num_objects, dtype=np.int32)
-        
-        for i in range(min(num_agents, self.max_num_objects)):
-            pos = agent_data["position"][i].numpy()
-            vel = agent_data["velocity"][i].numpy()
-            head = agent_data["heading"][i].numpy()
-            shape = agent_data["shape"][i].numpy()
-            
-            valid = agent_data["valid_mask"][i].numpy()
-            valid_steps = np.where(valid)[0]
-            
-            if len(valid_steps) > 0:
-                for t in range(self.current_index + 1):
-                    if t in valid_steps:
-                        agents_history[i, t] = [
-                            pos[t, 0], pos[t, 1], head[t],
-                            vel[t, 0], vel[t, 1],
-                            shape[0], shape[1], shape[2]
-                        ]
-                
-                for t in range(self.current_index, 91):
-                    if t in valid_steps:
-                        agents_future[i, t - self.current_index] = [
-                            pos[t, 0], pos[t, 1], head[t],
-                            vel[t, 0], vel[t, 1]
-                        ]
-                
-                agents_type[i] = agent_data["type"][i].numpy()
-                if agent_data["role"][i, 1].numpy() or agent_data["role"][i, 2].numpy():
-                    agents_interested[i] = 10
-                else:
-                    agents_interested[i] = 1
-                
-                agents_id[i] = agent_data["id"][i].numpy()
-        
-        polylines = np.zeros((self.max_polylines, self.num_points_polyline, 5), dtype=np.float32)
-        polylines_valid = np.zeros((self.max_polylines,), dtype=np.int32)
-        
-        traffic_light_points = np.zeros((self.max_polylines, 3), dtype=np.float32)  # 简化处理
-        
-        relations = calculate_relations(agents_history, polylines, traffic_light_points)
-        
-        anchors = self.generate_anchors(agents_history)
-        
-        vbd_input = {
-            'agents_history': np.float32(agents_history),
-            'agents_interested': np.int32(agents_interested),
-            'agents_type': np.int32(agents_type),
-            'agents_future': np.float32(agents_future),
-            'traffic_light_points': np.float32(traffic_light_points),
-            'polylines': np.float32(polylines),
-            'polylines_valid': np.int32(polylines_valid),
-            'relations': np.float32(relations),
-            'agents_id': np.int32(agents_id),
-            'anchors': np.float32(anchors),
-            'scenario_id': smart_data["scenario_id"]
+        anchors = []
+
+        for i in range(len(types)):
+            if types[i] == 1:
+                anchors.append(self.anchors['TYPE_VEHICLE'])
+            elif types[i] == 2:
+                anchors.append(self.anchors['TYPE_PEDESTRIAN'])
+            elif types[i] == 3:
+                anchors.append(self.anchors['TYPE_CYCLIST'])
+            else:
+                anchors.append(np.zeros_like(self.anchors['TYPE_VEHICLE']))
+
+        return np.array(anchors, dtype=np.float32)
+    
+
+    def convert_to_tensor(self, data):
+        """
+        Convert numpy array to torch tensor.
+
+        Args:
+            data(dict): Input data dictionary of numpy arrays.
+
+        Returns:
+            torch tensor dictionary.
+        """
+        agents_history = data['agents_history']
+        agents_interested = data['agents_interested']
+        agents_future = data['agents_future']
+        agents_type = data['agents_type']
+        traffic_light_points = data['traffic_light_points']
+        polylines = data['polylines']
+        polylines_valid = data['polylines_valid']
+        relations = data['relations']
+        anchors = self._process(agents_type)
+
+        tensors = {
+            "agents_history": torch.from_numpy(agents_history),
+            "agents_interested": torch.from_numpy(agents_interested),
+            "agents_future": torch.from_numpy(agents_future),
+            "agents_type": torch.from_numpy(agents_type),
+            "traffic_light_points": torch.from_numpy(traffic_light_points),
+            "polylines": torch.from_numpy(polylines),
+            "polylines_valid": torch.from_numpy(polylines_valid),
+            "relations": torch.from_numpy(relations),
+            "anchors": torch.from_numpy(anchors)
         }
-        
-        return vbd_input
-    
-    def generate_anchors(self, agents_history):
-        """
-        Generate anchors for VBD GoalPredictor.
-        
-        Args:
-            agents_history: agent history.
-        
-        Returns:
-            anchors: anchors.
-        """
-        num_anchors = 64
-        anchors = np.zeros((self.max_num_objects, num_anchors, 2), dtype=np.float32)
-        
-        for i in range(self.max_num_objects):
-            current_pos = agents_history[i, -1, :2]
-            if current_pos.sum() != 0:
-                angles = np.linspace(0, 2 * np.pi, num_anchors)
-                distances = np.linspace(5, 50, num_anchors)
-                anchors[i, :, 0] = current_pos[0] + distances * np.cos(angles)
-                anchors[i, :, 1] = current_pos[1] + distances * np.sin(angles)
-        
-        return anchors
+        return tensors

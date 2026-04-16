@@ -5,7 +5,7 @@ from lightning import LightningDataModule
 from lightning.pytorch.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADERS
 from torch.utils.data import DataLoader
 
-from src.vbd.data.dataset import SmartToVBDDataset
+from src.vbd.data.dataset import VBDDataset
 
 
 class VBDDataModule(LightningDataModule):
@@ -21,10 +21,7 @@ class VBDDataModule(LightningDataModule):
         num_workers: int,
         pin_memory: bool,
         persistent_workers: bool,
-        max_num_objects: int = 64,
-        max_polylines: int = 256,
-        num_points_polyline: int = 30,
-        current_index: int = 10,
+        anchor_path: str,
     ) -> None:
         super(VBDDataModule, self).__init__()
         self.train_batch_size = train_batch_size
@@ -37,44 +34,26 @@ class VBDDataModule(LightningDataModule):
         self.train_raw_dir = train_raw_dir
         self.val_raw_dir = val_raw_dir
         self.test_raw_dir = test_raw_dir
-        
-        # VBD settings
-        self.max_num_objects = max_num_objects
-        self.max_polylines = max_polylines
-        self.num_points_polyline = num_points_polyline
-        self.current_index = current_index
 
     def setup(self, stage: Optional[str] = None) -> None:
         if stage == "fit" or stage is None:
-            self.train_dataset = SmartToVBDDataset(
-                smart_data_dir=self.train_raw_dir,
-                max_num_objects=self.max_num_objects,
-                max_polylines=self.max_polylines,
-                num_points_polyline=self.num_points_polyline,
-                current_index=self.current_index,
+            self.train_dataset = VBDDataset(
+                vbd_data_dir=self.train_raw_dir,
+                anchor_path=self.anchor_path,
             )
-            self.val_dataset = SmartToVBDDataset(
-                smart_data_dir=self.val_raw_dir,
-                max_num_objects=self.max_num_objects,
-                max_polylines=self.max_polylines,
-                num_points_polyline=self.num_points_polyline,
-                current_index=self.current_index,
+            self.val_dataset = VBDDataset(
+                vbd_data_dir=self.val_raw_dir,
+                anchor_path=self.anchor_path,
             )
         elif stage == "validate":
-            self.val_dataset = SmartToVBDDataset(
-                smart_data_dir=self.val_raw_dir,
-                max_num_objects=self.max_num_objects,
-                max_polylines=self.max_polylines,
-                num_points_polyline=self.num_points_polyline,
-                current_index=self.current_index,
+            self.val_dataset = VBDDataset(
+                vbd_data_dir=self.val_raw_dir,
+                anchor_path=self.anchor_path,
             )
         elif stage == "test":
-            self.test_dataset = SmartToVBDDataset(
-                smart_data_dir=self.test_raw_dir,
-                max_num_objects=self.max_num_objects,
-                max_polylines=self.max_polylines,
-                num_points_polyline=self.num_points_polyline,
-                current_index=self.current_index,
+            self.test_dataset = VBDDataset(
+                vbd_data_dir=self.test_raw_dir,
+                anchor_path=self.anchor_path,
             )
         else:
             raise ValueError(f"{stage} should be one of [fit, validate, test]")
