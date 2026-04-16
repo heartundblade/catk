@@ -444,10 +444,10 @@ def wm2argo(file_path, split, output_dir, output_dir_gt):
         with open(output_dir / f"{scenario_id}.pkl", "wb+") as f:
             pickle.dump(data, f)
 
-        # if output_dir_gt is not None:
-        #     gt_dict = extract_gt_scenario(scenario)
-        #     with open(os.path.join(output_dir_gt, f"{scenario_id}.pkl"), 'wb') as f:
-        #         pickle.dump(gt_dict, f)
+        if output_dir_gt is not None:
+            gt_dict = extract_gt_scenario(scenario)
+            with open(os.path.join(output_dir_gt, f"{scenario_id}.pkl"), 'wb') as f:
+                pickle.dump(gt_dict, f)
 
 def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
     output_dir = Path(output_dir)

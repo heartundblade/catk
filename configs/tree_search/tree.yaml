@@ -7,11 +7,11 @@ tree_search:
   max_children: 5  # Maximum number of children per node
   num_iterations: 100  # Number of search iterations
   exploration_weight: 1.0  # UCT exploration weight
-  max_batches: 10  # Maximum number of batches to process
+  max_batches: 1  # Maximum number of batches to process
 
 # Beam search parameters
 beam_search:
   beam_width: 5  # Beam width (number of candidate sequences to keep)
-  max_length: 16  # Maximum sequence length (number of 2Hz steps)
-  max_batches: 10  # Maximum number of batches to process
+  max_length: 10  # Maximum sequence length (number of 2Hz steps)
+  max_batches: 20  # Maximum number of batches to process
   max_search_iterations: 6  # Maximum number of search iterations

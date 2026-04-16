@@ -65,7 +65,10 @@ model_config:
   
   # Trajectory recorder configuration
   trajectory_recorder:
-    is_active: true  # Set to true to enable trajectory recording
+    is_active: false  # Set to true to enable trajectory recording
     save_format: "json"  # Format to save trajectories (json)
-    save_interval: 100  # Save every 100 scenarios
+    save_interval: 160  # Save every 100 scenarios
     save_dir: null  # If null, saves to output_dir/trajectories
+    record_predictions: false  # Whether to record predictions
+    record_ground_truth: false  # Whether to record ground truth
+    record_wosac_metrics: false  # Whether to record WOSAC metrics

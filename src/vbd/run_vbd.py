@@ -90,7 +90,7 @@ def run(cfg: DictConfig) -> None:
         trainer.test(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
 
 
-@hydra.main(config_path="../configs/", config_name="run_vbd.yaml", version_base=None)
+@hydra.main(config_path="../../configs/", config_name="run_vbd.yaml", version_base=None)
 def main(cfg: DictConfig) -> None:
     torch.set_printoptions(precision=3)
 

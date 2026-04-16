@@ -7,6 +7,9 @@ defaults:
   - _self_
   - data: waymo
   - model: smart
+  - callbacks: default
+  - logger: wandb
+  - trainer: default
   - paths: default
   - hydra: default
   - tree_search: tree

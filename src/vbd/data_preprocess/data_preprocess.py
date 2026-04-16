@@ -102,74 +102,6 @@ _point_types = ['DASH_SOLID_YELLOW', 'DASH_SOLID_WHITE', 'DASHED_WHITE', 'DASHED
 _polygon_to_polygon_types = ['NONE', 'PRED', 'SUCC', 'LEFT', 'RIGHT']
 
 
-def get_agent_features(
-    track_infos: Dict[str, np.ndarray], split, num_historical_steps, num_steps
-) -> Dict[str, Any]:
-    """
-    track_infos:
-    object_id (100,) int64
-    object_type (100,) int32
-    states (100, 91, 9) float32
-    valid (100, 91) bool
-    role (100, 3) bool
-    """
-
-    idx_agents_to_add = []
-    for i in range(len(track_infos["object_id"])):
-        add_agent = track_infos["valid"][i, num_historical_steps - 1]
-
-        if add_agent:
-            idx_agents_to_add.append(i)
-
-    num_agents = len(idx_agents_to_add)
-    out_dict = {
-        "num_nodes": num_agents,
-        "valid_mask": torch.zeros([num_agents, num_steps], dtype=torch.bool),
-        "role": torch.zeros([num_agents, 3], dtype=torch.bool),
-        "id": torch.zeros(num_agents, dtype=torch.int64) - 1,
-        "type": torch.zeros(num_agents, dtype=torch.int32),
-        "position": torch.zeros([num_agents, num_steps, 3], dtype=torch.float32),
-        "heading": torch.zeros([num_agents, num_steps], dtype=torch.float32),
-        "velocity": torch.zeros([num_agents, num_steps, 2], dtype=torch.float32),
-        "shape": torch.zeros([num_agents, 3], dtype=torch.float32),
-    }
-
-    for i, idx in enumerate(idx_agents_to_add):
-
-        out_dict["role"][i] = torch.from_numpy(track_infos["role"][idx])
-        out_dict["id"][i] = track_infos["object_id"][idx]
-        out_dict["type"][i] = track_infos["object_type"][idx]
-
-        valid = track_infos["valid"][idx]  # [n_step]
-        states = track_infos["states"][idx]
-
-        object_shape = states[:, 3:6]  # [n_step, 3], length, width, height
-        object_shape = object_shape[valid].mean(axis=0)  # [3]
-        out_dict["shape"][i] = torch.from_numpy(object_shape)
-
-        valid_steps = np.where(valid)[0]
-        position = states[:, :3]  # [n_step, dim], x, y, z
-        velocity = states[:, 7:9]  # [n_step, 2], vx, vy
-        heading = states[:, 6]  # [n_step], heading
-        if valid.sum() > 1:
-            t_start, t_end = valid_steps[0], valid_steps[-1]
-            f_pos = interp1d(valid_steps, position[valid], axis=0)
-            f_vel = interp1d(valid_steps, velocity[valid], axis=0)
-            f_yaw = interp1d(valid_steps, np.unwrap(heading[valid], axis=0), axis=0)
-            t_in = np.arange(t_start, t_end + 1)
-            out_dict["valid_mask"][i, t_start : t_end + 1] = True
-            out_dict["position"][i, t_start : t_end + 1] = torch.from_numpy(f_pos(t_in))
-            out_dict["velocity"][i, t_start : t_end + 1] = torch.from_numpy(f_vel(t_in))
-            out_dict["heading"][i, t_start : t_end + 1] = torch.from_numpy(f_yaw(t_in))
-        else:
-            t = valid_steps[0]
-            out_dict["valid_mask"][i, t] = True
-            out_dict["position"][i, t] = torch.from_numpy(position[t])
-            out_dict["velocity"][i, t] = torch.from_numpy(velocity[t])
-            out_dict["heading"][i, t] = torch.tensor(heading[t])
-
-    return out_dict
-
 def sort_polygons_by_distance(
         pos_polygons, 
         reference_points,
@@ -222,12 +154,15 @@ def get_map_features(
         polyline_index = polygon["polyline_index"]
         pos_polygons[i, 0, :] = all_polylines[polyline_index[0], :2]
         pos_polygons[i, 1, :] = all_polylines[polyline_index[1]-1, :2]
-        pos_polygons[i, 2, :] = np.mean(all_polylines[polyline_index[0]:polyline_index[1], :2], dim=0)
+        pos_polygons[i, 2, :] = np.mean(all_polylines[polyline_index[0]:polyline_index[1], :2], axis=0)
 
-    index = sort_polygons_by_distance(
-        pos_polygons, agents_data
-    )
-    index = index[:max_polylines]
+    if num_polygons > max_polylines:
+        index = sort_polygons_by_distance(
+            pos_polygons, agents_data
+        )
+        index = index[:max_polylines]
+    else:
+        index = np.arange(num_polygons)
 
     # initialization
     points_position: List[Optional[np.ndarray]] = [None] * num_polygons
@@ -237,7 +172,7 @@ def get_map_features(
 
     points: List[Optional[np.ndarray]] = [None] * num_polygons
     polylines = []
-    for polygon in polygons[index]:
+    for polygon in [polygons[i] for i in index]:
         lane_segment_idx = polygon_ids.index(polygon["id"])
         polyline_index = polygon["polyline_index"]
         centerline = all_polylines[polyline_index[0]:polyline_index[1], :]
@@ -254,10 +189,12 @@ def get_map_features(
         points_type[lane_segment_idx] = polyline_type_data[:-1].astype(np.int64)
         
         if polygon["id"] in lane_segment_ids:
-            res = tf_current_light[tf_current_light["traffic_lane_ids"] == np.int32(polygon["id"])]
+            res = tf_current_light["traffic_light_states"][
+                tf_current_light["traffic_lane_ids"] == polygon["id"]
+            ]
             if len(res) != 0:
-                # point_light_type[lane_segment_idx] = torch.full_like(point_type[lane_segment_idx], res["traffic_light_states"].item())
-                points_light_type[lane_segment_idx] = np.full_like(points_type[lane_segment_idx], res["traffic_light_states"])
+                # point_light_type[lane_segment_idx] = torch.full_like(point_type[lane_segment_idx], res)
+                points_light_type[lane_segment_idx] = np.full_like(points_type[lane_segment_idx], res)
             else:
                 # point_light_type[lane_segment_idx] = torch.full_like(point_type[lane_segment_idx], 0)
                 points_light_type[lane_segment_idx] = np.full_like(points_type[lane_segment_idx], 0)
@@ -265,13 +202,13 @@ def get_map_features(
             # point_light_type[lane_segment_idx] = torch.full_like(point_type[lane_segment_idx], 0)
             points_light_type[lane_segment_idx] = np.full_like(points_type[lane_segment_idx], 0)
 
-        points[lane_segment_idx] = np.stack(
+        points[lane_segment_idx] = np.column_stack(
             [
                 points_position[lane_segment_idx],
                 points_orientation[lane_segment_idx], 
                 points_light_type[lane_segment_idx], 
                 points_type[lane_segment_idx]
-            ], axis=1
+            ]
         )
 
         polyline_len = points[lane_segment_idx].shape[0]
@@ -312,58 +249,6 @@ def get_map_features(
     return map_data
 
 
-def decode_tracks_from_proto(scenario):
-    sdc_track_index = scenario.sdc_track_index
-    track_index_predict = [i.track_index for i in scenario.tracks_to_predict]
-    object_id_interest = [i for i in scenario.objects_of_interest]
-
-    track_infos = {
-        "object_id": [],
-        "object_type": [],
-        "states": [],
-        "valid": [],
-        "role": [],
-    }
-    for i, cur_data in enumerate(scenario.tracks):  # number of objects
-        step_state = []
-        step_valid = []
-        for s in cur_data.states:
-            step_state.append(
-                [
-                    s.center_x,
-                    s.center_y,
-                    s.center_z,
-                    s.length,
-                    s.width,
-                    s.height,
-                    s.heading,
-                    s.velocity_x,
-                    s.velocity_y,
-                ]
-            )
-            step_valid.append(s.valid)
-            # This angle is normalized to [-pi, pi). The velocity vector in m/s
-
-        track_infos["object_id"].append(cur_data.id)
-        track_infos["object_type"].append(cur_data.object_type - 1)
-        track_infos["states"].append(np.array(step_state, dtype=np.float32))
-        track_infos["valid"].append(np.array(step_valid))
-
-        track_infos["role"].append([False, False, False])
-        if i in track_index_predict:
-            track_infos["role"][-1][2] = True  # predict=2
-        if cur_data.id in object_id_interest:
-            track_infos["role"][-1][1] = True  # interest=1
-        if i == sdc_track_index:  # ego_vehicle=0
-            track_infos["role"][-1][0] = True
-
-    track_infos["states"] = np.array(track_infos["states"], dtype=np.float32)
-    track_infos["valid"] = np.array(track_infos["valid"], dtype=bool)
-    track_infos["role"] = np.array(track_infos["role"], dtype=bool)
-    track_infos["object_id"] = np.array(track_infos["object_id"], dtype=np.int64)
-    track_infos["object_type"] = np.array(track_infos["object_type"], dtype=np.int32)
-    return track_infos
-
 from collections import defaultdict
 
 def decode_map_features_from_proto(map_features):
@@ -384,10 +269,11 @@ def decode_map_features_from_proto(map_features):
 
     for cur_data in map_features:
         cur_info = {'id': cur_data.id}
+        
 
         if cur_data.lane.ByteSize() > 0:
             cur_info['speed_limit_mph'] = cur_data.lane.speed_limit_mph
-            cur_info['type'] = cur_data.lane.type + 1  # 0: undefined, 1: freeway, 2: surface_street, 3: bike_lane
+            cur_info['type'] = cur_data.lane.type + 1  # 1: undefined, 2: freeway, 3: surface_street, 4: bike_lane after process
             cur_info['left_neighbors'] = [lane.feature_id for lane in cur_data.lane.left_neighbors]
 
             cur_info['right_neighbors'] = [lane.feature_id for lane in cur_data.lane.right_neighbors]
@@ -497,13 +383,13 @@ def process_agents(
         remove_history=False,
     ):
     tracks = scenario.tracks
-    sdc_id = scenario.sdc_track_index
+    sdc_idx = scenario.sdc_track_index
 
     # select agents based on distance to sdc
     sdc_position = np.array(
         [
-            tracks[sdc_id].states[current_index].center_x, 
-            tracks[sdc_id].states[current_index].center_y
+            tracks[sdc_idx].states[current_index].center_x, 
+            tracks[sdc_idx].states[current_index].center_y
         ]
     )
     agents_positions = []
@@ -518,20 +404,25 @@ def process_agents(
         distance_to_sdc = np.linalg.norm(
             np.array(agents_positions) - sdc_position, axis=-1
             )
-        agent_ids = np.argsort(distance_to_sdc)[:max_num_objects]
-        agent_ids = np.sort(agent_ids)
+        agents_idx = np.argsort(distance_to_sdc)[:max_num_objects]
+        agents_idx = np.sort(agents_idx)
     else:
-        agent_ids = select_agents
+        agents_idx = select_agents
+
 
     agents_history = np.zeros((max_num_objects, current_index+1, 9), dtype=np.float32)
     agents_type = np.zeros((max_num_objects,), dtype=np.int32)
     agents_interested = np.zeros((max_num_objects,), dtype=np.int32)
-    agents_future = np.zeros((max_num_objects, num_steps-current_index-1, 5), dtype=np.float32)
+    agents_future = np.zeros((max_num_objects, num_steps-current_index-1, 9), dtype=np.float32)
+    agents_id = np.zeros((max_num_objects,), dtype=np.int32)
     
-    for i, cur_data in enumerate(tracks[agent_ids]):
+    agents_idx_list = agents_idx.tolist()
+    for i, cur_data in enumerate([tracks[idx] for idx in agents_idx_list]):
         agent_type = cur_data.object_type
+        agent_id = cur_data.id
         valid = cur_data.states[current_index].valid
         
+        # leading to discontinuous result array
         if not valid:
             agents_interested[i] = 0
             continue
@@ -542,6 +433,7 @@ def process_agents(
             agents_interested[i] = 1
         
         agents_type[i] = agent_type
+        agents_id[i] = agent_id
         
         step_state = []
         step_valid = []
@@ -565,10 +457,12 @@ def process_agents(
         step_valid = np.array(step_valid, dtype=bool)
         
         agents_history[i] = step_state[:current_index+1]
-        agents_future[i] = step_state[current_index+1:, :5]
-
         agents_history[i][~step_valid[:current_index+1]] = 0
-        agents_future[i][~step_valid[current_index+1:]] = 0  
+        if step_state.shape[0]<num_steps:
+            continue
+        else:
+            agents_future[i] = step_state[current_index+1:]
+        agents_future[i][~step_valid[current_index+1:]] = 0
     
     if remove_history:
         agents_history[:, :-1] = 0
@@ -578,7 +472,7 @@ def process_agents(
         'future': agents_future,
         'interested': agents_interested,
         'type': agents_type,
-        'ids': agent_ids
+        'ids': agents_id
     }
 
 def process_traffic_lights(
@@ -600,13 +494,11 @@ def process_traffic_lights(
         8: "LANE_STATE_FLASHING_CAUTION",
     }
 
-    state_to_num = {v: k for k, v in signal_state.items()}
-
     s = dynamic_map_states[current_index]
     lane_id, state, stop_point = [], [], []
     for cur_signal in s.lane_states:  # (num_observed_signals)
         lane_id.append(cur_signal.lane)
-        state.append(state_to_num[cur_signal.state])
+        state.append(cur_signal.state)
         stop_point.append(
             [
                 cur_signal.stop_point.x, cur_signal.stop_point.y
@@ -615,7 +507,7 @@ def process_traffic_lights(
 
     traffic_lane_ids = np.array(lane_id, dtype=np.int32)  # [num_observed_signals]
     traffic_light_states = np.array(state, dtype=np.int32)  # [num_observed_signals]
-    traffic_stop_points = np.array(stop_point)  # [num_observed_signals, 2]
+    traffic_stop_points = np.array(stop_point).reshape(-1, 2)  # [num_observed_signals, 2]
     
     # here the process of catk (data_preprocess.py line 211-225) is ignored
     # the detailed traffic light states are saved
@@ -818,6 +710,8 @@ def wm2vbd(
         data_dict["scenario_id"] = scenario_id
         with open(output_dir / f"{scenario_id}.pkl", "wb+") as f:
             pickle.dump(data_dict, f)
+        
+        break
 
 
 def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
@@ -827,6 +721,7 @@ def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
 
     input_dir = Path(input_dir) / split
     packages = sorted([p.as_posix() for p in input_dir.glob("*")])
+    packages = packages[:5]
 
     func = partial(
         wm2vbd,

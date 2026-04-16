@@ -9,5 +9,6 @@ persistent_workers: true
 train_raw_dir: ${paths.cache_root}/training
 val_raw_dir: ${paths.cache_root}/validation
 val_tfrecords_splitted: ${paths.cache_root}/validation_tfrecords_splitted
+val_gt_scenario_dir: ${paths.cache_root}/validation_gt_test
 test_raw_dir: ${paths.cache_root}/testing
 train_max_num: 32

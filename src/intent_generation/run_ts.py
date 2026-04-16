@@ -70,8 +70,10 @@ def run(cfg: DictConfig) -> None:
     # Run tree search on test data
     log.info("Running search on validate data...")
     for batch_idx, data in enumerate(validate_dataloader):
-        if batch_idx >= cfg.get("max_batches", 10):
+        if batch_idx >= cfg.get("max_batches", 20):
             break
+        if batch_idx <= 7:
+            continue
         
         log.info(f"Processing batch {batch_idx+1}")
         
