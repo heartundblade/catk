@@ -477,6 +477,7 @@ def process_agents(
 
 def process_traffic_lights(
         dynamic_map_states,
+        max_num_traffic_lights=20,
         current_index=10,
         ):
     signal_state = {
@@ -515,6 +516,15 @@ def process_traffic_lights(
         [traffic_stop_points, traffic_light_states[:, None]], axis=1
         )
     traffic_light_points = np.float32(traffic_light_points)
+
+    num_traffic_lights = traffic_light_points.shape[0]
+    if num_traffic_lights >= max_num_traffic_lights:
+        traffic_light_points = traffic_light_points[:max_num_traffic_lights]
+    else:
+        traffic_light_points = np.pad(
+            traffic_light_points, 
+            ((0, max_num_traffic_lights-num_traffic_lights), (0, 0))
+        )
 
     return {
         'traffic_light_points': traffic_light_points,
@@ -571,8 +581,8 @@ def process_roadgraph(
         polylines_valid = np.pad(polylines_valid, (0, max_polylines-polylines_valid.shape[0]))
     
     return {
-        'polylines': polylines,
-        'polylines_valid': polylines_valid
+        'polylines': polylines,  # [num_polylines, num_points_polyline, 5]
+        'polylines_valid': polylines_valid  # [num_polylines,]
     }
 
 def calculate_relations(agents_history, polylines, traffic_light_points):
@@ -653,8 +663,9 @@ def data_process_scenario(
     )
     
     traffic_light_data = process_traffic_lights(
-        scenario.dynamic_map_states
-    )
+        scenario.dynamic_map_states,
+        max_num_traffic_lights=20,
+        )
     
     roadgraph_data = process_roadgraph(
         scenario, 

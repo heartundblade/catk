@@ -233,11 +233,11 @@ class MapEncoder(nn.Module):
 class TrafficLightEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.type_embed = nn.Embedding(8, 256)
+        self.type_embed = nn.Embedding(9, 256)
 
     def forward(self, inputs):
         # inputs [B, TL, 3]
-        traffic_light_type = inputs[:, :, 2].long().clamp(0, 7)
+        traffic_light_type = inputs[:, :, 2].long().clamp(0, 8)
         type_embed = self.type_embed(traffic_light_type)
         output = type_embed
 
