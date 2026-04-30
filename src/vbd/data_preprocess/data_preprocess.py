@@ -270,7 +270,6 @@ def decode_map_features_from_proto(map_features):
     for cur_data in map_features:
         cur_info = {'id': cur_data.id}
         
-
         if cur_data.lane.ByteSize() > 0:
             cur_info['speed_limit_mph'] = cur_data.lane.speed_limit_mph
             cur_info['type'] = cur_data.lane.type + 1  # 1: undefined, 2: freeway, 3: surface_street, 4: bike_lane after process
@@ -413,7 +412,7 @@ def process_agents(
     agents_history = np.zeros((max_num_objects, current_index+1, 9), dtype=np.float32)
     agents_type = np.zeros((max_num_objects,), dtype=np.int32)
     agents_interested = np.zeros((max_num_objects,), dtype=np.int32)
-    agents_future = np.zeros((max_num_objects, num_steps-current_index-1, 9), dtype=np.float32)
+    agents_future = np.zeros((max_num_objects, num_steps-current_index, 9), dtype=np.float32)
     agents_id = np.zeros((max_num_objects,), dtype=np.int32)
     
     agents_idx_list = agents_idx.tolist()
@@ -461,15 +460,20 @@ def process_agents(
         if step_state.shape[0]<num_steps:
             continue
         else:
-            agents_future[i] = step_state[current_index+1:]
-        agents_future[i][~step_valid[current_index+1:]] = 0
+            agents_future[i] = step_state[current_index:]
+        agents_future[i][~step_valid[current_index:]] = 0
     
+    agents_future_valid = np.not_equal(
+        np.sum(agents_future, axis=-1), 0
+    )
+
     if remove_history:
         agents_history[:, :-1] = 0
     
     return {
         'history': agents_history,
         'future': agents_future,
+        'future_valid': agents_future_valid,
         'interested': agents_interested,
         'type': agents_type,
         'ids': agents_id
@@ -553,7 +557,9 @@ def process_roadgraph(
         roadgraph data.
     """
     map_infos = decode_map_features_from_proto(scenario.map_features)
-    
+    if np.all(map_infos['all_polylines']==0):
+        print(f'empty polylines scenario id: {scenario.scenario_id}')
+
     map_data = get_map_features(
         map_infos,
         traffic_light_data,
@@ -585,12 +591,16 @@ def process_roadgraph(
         'polylines_valid': polylines_valid  # [num_polylines,]
     }
 
-def calculate_relations(agents_history, polylines, traffic_light_points):
+def calculate_relations(
+        agents_history, 
+        polylines, 
+        traffic_light_points
+    ):
     """
     Calculate the relations between agents, polylines, and traffic lights.
     
     Args:
-        agents_history(numpy.ndarray): Array of agent positions and orientations.
+        agents_history(numpy.ndarray): Array of agent positions and orientations. [x, y, heading]
         polylines(numpy.ndarray): Array of polyline positions.
         traffic_light_points(numpy.ndarray): Array of traffic light positions.
         
@@ -682,9 +692,11 @@ def data_process_scenario(
     )
     relations = relations.astype(np.float32)
 
+    # TODO: add agents_future_valid
     data = {
         'agents_history': agents_data['history'],
         'agents_future': agents_data['future'],
+        'agents_future_valid': agents_data['future_valid'],
         'agents_interested': agents_data['interested'],
         'agents_type': agents_data['type'],
         'traffic_light_points': traffic_light_data['traffic_light_points'],
@@ -721,9 +733,8 @@ def wm2vbd(
         data_dict["scenario_id"] = scenario_id
         with open(output_dir / f"{scenario_id}.pkl", "wb+") as f:
             pickle.dump(data_dict, f)
-        
-        break
 
+        break
 
 def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
     output_dir = Path(output_dir)

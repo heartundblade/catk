@@ -93,7 +93,7 @@ class GoalPredictor(nn.Module):
         mask = torch.cat([inputs['agents_mask'], inputs['maps_mask'], 
                           inputs['traffic_lights_mask']], dim=-1)
         relations = inputs['relation_encodings']
-                
+
         actions = []
         scores = []
         for i in range(self._agents_len):
@@ -117,7 +117,14 @@ class GoalPredictor(nn.Module):
 
 
 class Denoiser(nn.Module):
-    def __init__(self, future_len=80, action_len=5, agents_len=32, steps=100, input_dim=5):
+    def __init__(
+            self, 
+            future_len=80, 
+            action_len=5, 
+            agents_len=32, 
+            steps=100, 
+            input_dim=5
+        ):
         super().__init__()
         self._agents_len = agents_len
         self._action_len = action_len
@@ -201,7 +208,7 @@ class AgentEncoderV2(nn.Module):
         
         
     def forward(self, history, type):
-        cur = history[:, -1, 3:] # only take [vel_x, vel_y, length, width, height]
+        cur = history[:, -1, 3:8] # only take [vel_x, vel_y, length, width, height]
         output = self.motion(cur)
         type_embed = self.type_embed(type)
         output = output + type_embed
@@ -478,8 +485,14 @@ class TransformerDecoder(nn.Module):
         noisy_trajectories: [B, Na, T_f, 5]
         '''
         # get query
-        noisy_trajectories = torch.reshape(noisy_trajectories, (-1, self._agents_len, 
-                                                                self._future_len, self._action_len, self._input_dim)) 
+        noisy_trajectories = torch.reshape(
+            noisy_trajectories, 
+            (
+                -1, 
+                self._agents_len, self._future_len, self._action_len, 
+                self._input_dim
+            )
+        )
         future_states = self.encoder(noisy_trajectories)
         future_states = future_states.max(dim=3).values # [B, Na, T, 256]
         time_embedding = self.time_embedding(self.time) # [1, T, 256]

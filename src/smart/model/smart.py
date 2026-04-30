@@ -467,28 +467,6 @@ class SMART(LightningModule):
         pred_traj = torch.stack(pred_traj, dim=1)  # [n_ag, n_rollout, n_step, 2]
         pred_z = torch.stack(pred_z, dim=1)  # [n_ag, n_rollout, n_step]
         pred_head = torch.stack(pred_head, dim=1)  # [n_ag, n_rollout, n_step]
-        
-        # Record trajectories
-        if self.trajectory_recorder.is_active:
-            # Get current WOSAC metrics if available
-            current_wosac_metrics = None
-            if hasattr(self, 'wosac_metrics'):
-                try:
-                    # Compute current metrics for this batch
-                    current_wosac_metrics = self.wosac_metrics.compute()
-                except Exception as e:
-                    pass
-            
-            self.trajectory_recorder.update(
-                scenario_id=data["scenario_id"],
-                agent_id=data["agent"]["id"],
-                pred_traj=pred_traj,
-                pred_z=pred_z,
-                pred_head=pred_head,
-                gt_traj=data["agent"]["position"][:, self.num_historical_steps :, : pred_traj.shape[-1]] if "position" in data["agent"] else None,
-                gt_valid=data["agent"]["valid_mask"][:, self.num_historical_steps :] if "valid_mask" in data["agent"] else None,
-                wosac_metrics=current_wosac_metrics,
-            )
 
         # ! WOSAC submission save
         self.wosac_submission.update(
@@ -512,7 +490,3 @@ class SMART(LightningModule):
     def on_test_epoch_end(self):
         if self.global_rank == 0:
             self.wosac_submission.save_sub_file()
-            
-            # Save trajectories at the end of test epoch
-            if self.trajectory_recorder.is_active:
-                self.trajectory_recorder.on_epoch_end()

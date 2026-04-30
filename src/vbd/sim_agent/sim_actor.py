@@ -544,7 +544,15 @@ class VBDTest(VBD):
         num_step = self._future_len//self._action_len
         action_dim = 2
         
-        diffusion_steps = list(reversed(range(self.early_stop, self.noise_scheduler.num_steps, self.skip)))
+        diffusion_steps = list(
+            reversed(
+                range(
+                    self.early_stop, 
+                    self.noise_scheduler.num_steps, 
+                    self.skip
+                )
+            )
+        )
         
         # History
         x_t_history = []

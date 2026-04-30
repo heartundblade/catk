@@ -1,58 +1,58 @@
 import tensorflow as tf
 import torch
-from waymax import dataloader
+# from waymax import dataloader
 
 import numpy as np
-from waymax import datatypes
-import matplotlib as mpl
-from matplotlib import pyplot as plt
+# from waymax import datatypes
+# import matplotlib as mpl
+# from matplotlib import pyplot as plt
 
-def plot_scenario(agents, futures, polyilnes, traffic_lights):
-    """
-    Plot the scenario with agents, futures, polylines, and traffic lights.
+# def plot_scenario(agents, futures, polyilnes, traffic_lights):
+#     """
+#     Plot the scenario with agents, futures, polylines, and traffic lights.
 
-    Args:
-        agents (numpy.ndarray): Array of agent positions and orientations.
-        futures (numpy.ndarray): Array of future trajectories.
-        polyilnes (numpy.ndarray): Array of polyline positions.
-        traffic_lights (numpy.ndarray): Array of traffic light positions.
-    """
-    # plot map
-    for i in range(polyilnes.shape[0]):
-        if polyilnes[i, 0, 0] != 0:
-            line = polyilnes[i]
-            line = line[line[:, 0] != 0]
-            plt.plot(line[:, 0], line[:, 1], '.', markersize=2)
+#     Args:
+#         agents (numpy.ndarray): Array of agent positions and orientations.
+#         futures (numpy.ndarray): Array of future trajectories.
+#         polyilnes (numpy.ndarray): Array of polyline positions.
+#         traffic_lights (numpy.ndarray): Array of traffic light positions.
+#     """
+#     # plot map
+#     for i in range(polyilnes.shape[0]):
+#         if polyilnes[i, 0, 0] != 0:
+#             line = polyilnes[i]
+#             line = line[line[:, 0] != 0]
+#             plt.plot(line[:, 0], line[:, 1], '.', markersize=2)
 
-    # plot agents
-    for i in range(agents.shape[0]):
-        pos_x, pos_y = agents[i, -1, 0], agents[i, -1, 1]
-        heading = agents[i, -1, 2]
-        length, width = agents[i, -1, 5], agents[i, -1, 6]
-        rect = plt.Rectangle(
-            (pos_x - length/2, pos_y - width/2), length, width, linewidth=2, color='b', alpha=0.9, zorder=3,
-            transform=mpl.transforms.Affine2D().rotate_around(*(pos_x, pos_y), heading) + plt.gca().transData
-        )
-        plt.gca().add_patch(rect)
-        if agents[i, -1, 0] != 0:
-            agent = agents[i][agents[i, :, 0] != 0]
-            plt.plot(agent[:, 0], agent[:, 1], 'b')
+#     # plot agents
+#     for i in range(agents.shape[0]):
+#         pos_x, pos_y = agents[i, -1, 0], agents[i, -1, 1]
+#         heading = agents[i, -1, 2]
+#         length, width = agents[i, -1, 5], agents[i, -1, 6]
+#         rect = plt.Rectangle(
+#             (pos_x - length/2, pos_y - width/2), length, width, linewidth=2, color='b', alpha=0.9, zorder=3,
+#             transform=mpl.transforms.Affine2D().rotate_around(*(pos_x, pos_y), heading) + plt.gca().transData
+#         )
+#         plt.gca().add_patch(rect)
+#         if agents[i, -1, 0] != 0:
+#             agent = agents[i][agents[i, :, 0] != 0]
+#             plt.plot(agent[:, 0], agent[:, 1], 'b')
 
-    # plot traffic lights
-    for i in range(traffic_lights.shape[0]):
-        if traffic_lights[i, 0] != 0:
-            circle = plt.Circle((traffic_lights[i, 0], traffic_lights[i, 1]), 1, color='k', alpha=0.9, zorder=3)
-            plt.gca().add_patch(circle)
+#     # plot traffic lights
+#     for i in range(traffic_lights.shape[0]):
+#         if traffic_lights[i, 0] != 0:
+#             circle = plt.Circle((traffic_lights[i, 0], traffic_lights[i, 1]), 1, color='k', alpha=0.9, zorder=3)
+#             plt.gca().add_patch(circle)
 
-    # plot futures
-    for i in range(futures.shape[0]):
-        if futures[i, 0, 0] != -1:
-            line = futures[i][futures[i, :, 0] != -1]
-            plt.plot(line[:, 0], line[:, 1], 'r')
+#     # plot futures
+#     for i in range(futures.shape[0]):
+#         if futures[i, 0, 0] != -1:
+#             line = futures[i][futures[i, :, 0] != -1]
+#             plt.plot(line[:, 0], line[:, 1], 'r')
         
-    plt.axis('equal')
-    plt.tight_layout()
-    plt.show()
+#     plt.axis('equal')
+#     plt.tight_layout()
+#     plt.show()
 
 def wrap_to_pi(angle):
     """
@@ -105,17 +105,18 @@ def filter_topk_roadgraph_points(roadgraph, reference_points, topk):
         )
         filtered = np.take_along_axis(stacked, top_idx[..., None], axis=-2)
 
-        return datatypes.RoadgraphPoints(
-            x=filtered[..., 0],
-            y=filtered[..., 1],
-            z=filtered[..., 2],
-            dir_x=filtered[..., 3],
-            dir_y=filtered[..., 4],
-            dir_z=filtered[..., 5],
-            types=filtered[..., 6].astype(np.int32),
-            ids=filtered[..., 7].astype(np.int32),
-            valid=filtered[..., 8].astype(np.bool_),
-        )
+        # return datatypes.RoadgraphPoints(
+        #     x=filtered[..., 0],
+        #     y=filtered[..., 1],
+        #     z=filtered[..., 2],
+        #     dir_x=filtered[..., 3],
+        #     dir_y=filtered[..., 4],
+        #     dir_z=filtered[..., 5],
+        #     types=filtered[..., 6].astype(np.int32),
+        #     ids=filtered[..., 7].astype(np.int32),
+        #     valid=filtered[..., 8].astype(np.bool_),
+        # )
+        return
     
     else:
         return roadgraph
@@ -176,46 +177,46 @@ def calculate_relations(agents, polylines, traffic_lights):
 
     return relations
 
-def tf_preprocess(serialized: bytes) -> dict[str, tf.Tensor]:
-    """
-    Preprocesses the serialized data.
+# def tf_preprocess(serialized: bytes) -> dict[str, tf.Tensor]:
+#     """
+#     Preprocesses the serialized data.
 
-    Args:
-        serialized (bytes): The serialized data.
+#     Args:
+#         serialized (bytes): The serialized data.
 
-    Returns:
-        dict[str, tf.Tensor]: The preprocessed data.
-    """
-    womd_features = dataloader.womd_utils.get_features_description(
-        include_sdc_paths=False,
-        max_num_rg_points=30000,
-        num_paths=None,
-        num_points_per_path=None,
-    )
-    womd_features['scenario/id'] = tf.io.FixedLenFeature([1], tf.string)
+#     Returns:
+#         dict[str, tf.Tensor]: The preprocessed data.
+#     """
+#     womd_features = dataloader.womd_utils.get_features_description(
+#         include_sdc_paths=False,
+#         max_num_rg_points=30000,
+#         num_paths=None,
+#         num_points_per_path=None,
+#     )
+#     womd_features['scenario/id'] = tf.io.FixedLenFeature([1], tf.string)
 
-    deserialized = tf.io.parse_example(serialized, womd_features)
-    parsed_id = deserialized.pop('scenario/id')
-    deserialized['scenario/id'] = tf.io.decode_raw(parsed_id, tf.uint8)
-    return dataloader.preprocess_womd_example(
-        deserialized,
-        aggregate_timesteps=True,
-        max_num_objects=None,
-    )
+#     deserialized = tf.io.parse_example(serialized, womd_features)
+#     parsed_id = deserialized.pop('scenario/id')
+#     deserialized['scenario/id'] = tf.io.decode_raw(parsed_id, tf.uint8)
+#     return dataloader.preprocess_womd_example(
+#         deserialized,
+#         aggregate_timesteps=True,
+#         max_num_objects=None,
+#     )
 
-def tf_postprocess(example: dict[str, tf.Tensor]):
-    """
-    Postprocesses the example.
+# def tf_postprocess(example: dict[str, tf.Tensor]):
+#     """
+#     Postprocesses the example.
 
-    Args:
-        example (dict[str, tf.Tensor]): The example to be postprocessed.
+#     Args:
+#         example (dict[str, tf.Tensor]): The example to be postprocessed.
 
-    Returns:
-        tuple: A tuple containing the scenario ID and the postprocessed scenario.
-    """
-    scenario = dataloader.simulator_state_from_womd_dict(example)
-    scenario_id = example['scenario/id']
-    return scenario_id, scenario
+#     Returns:
+#         tuple: A tuple containing the scenario ID and the postprocessed scenario.
+#     """
+#     scenario = dataloader.simulator_state_from_womd_dict(example)
+#     scenario_id = example['scenario/id']
+#     return scenario_id, scenario
 
 def data_process_agent(
     scenario,

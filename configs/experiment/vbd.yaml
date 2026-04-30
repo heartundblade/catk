@@ -3,3 +3,9 @@
 defaults:
   # - override /trainer: ddp
   - override /model: VBD
+
+trainer:
+  max_epochs: 16
+  limit_train_batches: 1.0
+  limit_val_batches: 1.0
+  limit_test_batches: 1.0

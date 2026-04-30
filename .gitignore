@@ -2,4 +2,5 @@
 **/*.pyc
 **/logs
 **/ckpt_files
-**/*.sh
+# **/*.sh
+**/*.pkl

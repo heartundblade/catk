@@ -2,9 +2,23 @@ import torch
 import lightning.pytorch as pl
 from .modules import Encoder, Denoiser, GoalPredictor
 from .utils import DDPM_Sampler
-from .model_utils import inverse_kinematics, roll_out, batch_transform_trajs_to_global_frame
-from torch.nn.functional import smooth_l1_loss, cross_entropy
+from .model_utils import (
+    inverse_kinematics, 
+    roll_out, 
+    batch_transform_trajs_to_global_frame,
+    batch_transform_polylines_to_local_frame,
+    batch_transform_trajs_to_local_frame,
+    batch_calculate_relations,
+)
+from src.vbd.sim_agent.utils import *
+from src.vbd.data_preprocess.data_preprocess import calculate_relations
 
+from torch.nn.functional import smooth_l1_loss, cross_entropy
+from src.smart.metrics import (
+    WOSACMetric,
+    WOSACMetrics
+)
+from src.utils.wosac_utils import get_scenario_rollouts, get_scenario_id_int_tensor
 
 class VBD(pl.LightningModule):
     """
@@ -33,6 +47,7 @@ class VBD(pl.LightningModule):
         self._encoder_version = cfg.get('encoder_version', 'v1')
         self._action_mean = cfg['action_mean']
         self._action_std = cfg['action_std']
+        self._step_len = cfg['step_len']
         
         self._train_encoder = cfg.get('train_encoder', True)
         self._train_denoiser = cfg.get('train_denoiser', True)
@@ -42,7 +57,12 @@ class VBD(pl.LightningModule):
         self._schedule_type = cfg.get('schedule_type', 'cosine')
         self._replay_buffer = cfg.get('replay_buffer', False)
         self._embeding_dim = cfg.get('embeding_dim', 5) # By default, the embed is the noised trajectory so the dimension is 5
-    
+        
+        self._val_open_loop = cfg.get('val_open_loop', True)
+        self._val_closed_loop = cfg.get('val_closed_loop', False)
+        self._n_rollout_closed_val = cfg.get('n_rollout_closed_val', 32)
+        self.log_epoch = cfg.get('log_epoch', -1)
+
         self.encoder = Encoder(self._encoder_layers, version=self._encoder_version)
         
         self.denoiser = Denoiser(
@@ -70,10 +90,14 @@ class VBD(pl.LightningModule):
             tau = cfg.get('schedule_tau', 1.0),
             scale = cfg.get('schedule_scale', 1.0),
         )
-                
+        if cfg.get('fast_wosac_metric', False):
+            self.wosac_metrics = WOSACMetric('2024')
+        else:
+            self.wosac_metrics = WOSACMetrics("val_closed")
+
         self.register_buffer('action_mean', torch.tensor(self._action_mean))  
         self.register_buffer('action_std', torch.tensor(self._action_std))
-    
+
     ################### Training Setup ###################
     def configure_optimizers(self):
         '''
@@ -132,7 +156,7 @@ class VBD(pl.LightningModule):
         )
         
         return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
-        
+
     def forward(self, inputs, noised_actions_normalized, diffusion_step):
         """
         Forward pass of the VBD model.
@@ -158,7 +182,7 @@ class VBD(pl.LightningModule):
             output_dict.update(predictor_outputs)
             
         return output_dict
-        
+
     def forward_denoiser(self, encoder_outputs, noised_actions_normalized, diffusion_step):
         """
         Forward pass of the denoiser module.
@@ -193,7 +217,7 @@ class VBD(pl.LightningModule):
             'denoised_actions': denoised_actions,
             'denoised_trajs': denoised_trajs,
         }
-    
+
     def forward_predictor(self, encoder_outputs):
         """
         Forward pass of the predictor module.
@@ -211,7 +235,7 @@ class VBD(pl.LightningModule):
         assert encoder_outputs['agents'].shape[1] >= self._agents_len, 'Too many agents to consider'
 
         # Roll out
-        goal_actions = self.unnormalize_actions(goal_actions_normalized)    
+        goal_actions = self.unnormalize_actions(goal_actions_normalized)
         goal_trajs = roll_out(current_states[:, :, None, :], goal_actions,
                     action_len=self.predictor._action_len, global_frame=True)
         
@@ -221,7 +245,7 @@ class VBD(pl.LightningModule):
             'goal_scores': goal_scores,
             'goal_trajs': goal_trajs,
         }
-        
+
     def forward_and_get_loss(self, batch, prefix = '', debug = False):
         """
         Forward pass of the model and compute the loss.
@@ -237,14 +261,15 @@ class VBD(pl.LightningModule):
             debug_outputs: Dictionary containing debug outputs.
         """
         # data inputs
-        agents_future = batch['agents_future'][:, :self._agents_len]
+        self._agents_len = 64  # TODO: delete this after re-training
+        agents_future = batch['agents_future'][:, :self._agents_len]  # [B, self._agents_len, self._future_len+1, 9]
+
+        agents_future_valid = batch['agents_future_valid'][:, :self._agents_len]
+        # agents_future_valid = torch.ne(agents_future.sum(-1), 0)
         
-        # TODO: Investigate why this to NAN
-        # agents_future_valid = batch['agents_future_valid'][:, :self._agents_len]
-        agents_future_valid = torch.ne(agents_future.sum(-1), 0)
         agents_interested = batch['agents_interested'][:, :self._agents_len]
         anchors = batch['anchors'][:, :self._agents_len]
-                
+
         # get actions from trajectory
         gt_actions, gt_actions_valid = inverse_kinematics(
             agents_future,
@@ -262,14 +287,18 @@ class VBD(pl.LightningModule):
         
         ############## Run Encoder ##############
         encoder_outputs = self.encoder(batch)
+        history = encoder_outputs['agents']
         
+        # are_agents_zero1 = (history[:, :self._agents_len, :, :] == 0).all(dim=(2, 3)).squeeze(0)
+        # are_agents_zero2 = (history[:, self._agents_len:, :, :] == 0).all(dim=(2, 3)).squeeze(0)
+        # print(are_agents_zero1, are_agents_zero2)  # [True, False, ...]        
+
         ############### Denoise #################
         if self._train_denoiser:
-            
             diffusion_steps = torch.randint(
                 0, self.noise_scheduler.num_steps, (B,),
                 device=agents_future.device
-            ).long().unsqueeze(-1).repeat(1, A).view(B, A, 1, 1)
+            ).long().unsqueeze(-1).repeat(1, A).view(B, A, 1, 1)  # [B, A, 1, 1]
             
             # sample noise 
             # noise = torch.randn(B*A, T, D).type_as(agents_future)
@@ -286,10 +315,14 @@ class VBD(pl.LightningModule):
             if self._replay_buffer:
                 with torch.no_grad():
                     # Forward for one step
-                    denoise_outputs = self.forward_denoiser(encoder_outputs, gt_actions_normalized, diffusion_steps.view(B,A))
-                    
+                    denoise_outputs = self.forward_denoiser(
+                        encoder_outputs, 
+                        gt_actions_normalized, 
+                        diffusion_steps.view(B,A)
+                    )
+
                     x_0 = denoise_outputs['denoised_actions_normalized']
-        
+
                     # Step to sample from P(x_t-1 | x_t, x_0)
                     x_t_prev = self.noise_scheduler.step(
                         model_output = x_0,
@@ -299,13 +332,17 @@ class VBD(pl.LightningModule):
                     )
                     noised_action_normalized = x_t_prev.detach()
             
-            denoise_outputs = self.forward_denoiser(encoder_outputs, noised_action_normalized, diffusion_steps.view(B,A))
+            denoise_outputs = self.forward_denoiser(
+                encoder_outputs, 
+                noised_action_normalized, 
+                diffusion_steps.view(B,A)
+            )
             
             debug_outputs.update(denoise_outputs)
             debug_outputs['noise'] = noise
             debug_outputs['diffusion_steps'] = diffusion_steps
 
-            # Get Loss 
+            # Get Loss
             denoised_trajs = denoise_outputs['denoised_trajs']
             if self._prediction_type == 'sample':
                 state_loss_mean, yaw_loss_mean = self.denoise_loss(
@@ -323,7 +360,7 @@ class VBD(pl.LightningModule):
                     timesteps=diffusion_steps,
                     gt_noise=noise,
                 )
-                                
+
                 log_dict.update({
                     prefix+'state_loss': state_loss_mean.item(),
                     prefix+'yaw_loss': yaw_loss_mean.item(),
@@ -352,7 +389,6 @@ class VBD(pl.LightningModule):
             else:
                 raise ValueError('Invalid prediction type')
                 
-
             denoise_ade, denoise_fde = self.calculate_metrics_denoise(
                 denoised_trajs, agents_future, agents_future_valid, agents_interested, 8
             )
@@ -367,7 +403,7 @@ class VBD(pl.LightningModule):
             goal_outputs = self.forward_predictor(encoder_outputs)
             debug_outputs.update(goal_outputs)
 
-            # get loss 
+            # get loss
             goal_scores = goal_outputs['goal_scores']
             goal_trajs = goal_outputs['goal_trajs']
             
@@ -378,7 +414,7 @@ class VBD(pl.LightningModule):
             )
 
             pred_loss = goal_loss_mean + 0.05 * score_loss_mean
-            total_loss += 1.0 * pred_loss 
+            total_loss += 1.0 * pred_loss
             
             pred_ade, pred_fde = self.calculate_metrics_predict(
                 goal_trajs, agents_future, agents_future_valid, agents_interested, 8
@@ -397,7 +433,120 @@ class VBD(pl.LightningModule):
             return total_loss, log_dict, debug_outputs
         else:
             return total_loss, log_dict
-    
+
+    def step_denoiser(self, x_t: torch.Tensor, c: dict, t: int):
+        """
+        Perform a denoising step to sample x_{t-1} ~ P[x_{t-1} | x_t, D(x_t, c, t)].
+        
+        Args:
+            x_t (torch.Tensor): The input tensor representing the current state. Shape: (num_batch, num_agent, num_action, action_dim)
+            c (dict): The conditional variable dictionary.
+            t (int): The number of diffusion steps.
+            
+        Returns:
+            denoiser_output (dict): The denoiser outputs.
+            x_t_prev (torch.Tensor): The tensor representing the previous noised action. Shape: (num_batch, num_agent, num_action, action_dim)
+        """
+        
+        if self.denoiser is None:
+            raise RuntimeError("Denoiser is not defined")
+        
+        # Denoise to reconstruct x_0 ~ D(x_t, c, t)
+        denoiser_output = self.forward_denoiser(
+            encoder_outputs=c,
+            noised_actions_normalized=x_t,
+            diffusion_step=t,
+        )
+        
+        x_0 = denoiser_output['denoised_actions_normalized']
+        
+        # Step to sample from P(x_t-1 | x_t, x_0)
+        x_t_prev = self.noise_scheduler.step(
+            model_output = x_0,
+            timesteps = t,
+            sample = x_t,
+            prediction_type=self._prediction_type if hasattr(self, '_prediction_type') else 'sample',
+        )
+
+        return denoiser_output, x_t_prev
+
+    def sample_denoiser(
+            self, 
+            batch, 
+            num_samples=1, 
+            x_t = None, 
+            fix_t: int = -1, 
+            calc_loss: bool = False, 
+            **kwargs
+        ):
+        """
+        Perform denoising inference on the given batch of data.
+
+        Args:
+            batch (dict): The input batch of data.
+            guidance_func (callable, optional): A callable function that provides guidance for denoising. Defaults to None.
+            early_stop (int, optional): The index of the step at which denoising should stop. Defaults to 0.
+            skip (int, optional): The number of steps to skip between denoising iterations. Defaults to 1.
+            **kwargs: Additional keyword arguments for guidance.
+        Returns:
+            dict: The denoising outputs, including the history of noised action normalization. States are global frame.
+
+        """
+        # Encode the scene
+        batch = self.batch_to_device(batch, self.device)
+        
+        encoder_outputs = self.encoder(batch)
+        
+        if num_samples > 1:
+            encoder_outputs = duplicate_batch(encoder_outputs, num_samples)
+        
+        agents_history = encoder_outputs['agents']
+        num_batch, num_agent = agents_history.shape[:2]
+        num_step = self._future_len//self._action_len
+        action_dim = 2
+        
+        diffusion_steps = list(
+            reversed(
+                range(
+                    # self.early_stop, 
+                    0,
+                    self.noise_scheduler.num_steps, 
+                    # self.skip
+                    1,
+                )
+            )
+        )
+        
+        # History
+        x_t_history = []
+        denoiser_output_history = []
+        # guide_history = []
+        
+        # Inital X_T
+        if x_t is None:
+            x_t = torch.randn(num_batch, num_agent, num_step, action_dim, device=self.device)
+        else:
+            x_t = x_t.to(self.device)
+
+        for t in diffusion_steps:
+            x_t_history.append(x_t.detach().cpu().numpy())
+
+            denoiser_outputs, x_t = self.step_denoiser(
+                x_t = x_t, 
+                c = encoder_outputs, 
+                t = fix_t if fix_t >= 0 else t,
+            )
+            
+            denoiser_output_history.append(torch_dict_to_numpy(denoiser_outputs))
+        
+        denoiser_outputs['history'] = {
+            'x_t_history': np.stack(x_t_history, axis=0),
+            'denoiser_output_history': stack_dict(denoiser_output_history),
+            # 'guide_history': stack_dict(guide_history),
+        }
+        
+        return denoiser_outputs
+
     def training_step(self, batch, batch_idx):
         """
         Training step of the model.
@@ -408,7 +557,7 @@ class VBD(pl.LightningModule):
 
         Returns:
             loss: Loss value.
-        """        
+        """
         loss, log_dict = self.forward_and_get_loss(batch, prefix='train/')
         self.log_dict(
             log_dict, 
@@ -426,17 +575,138 @@ class VBD(pl.LightningModule):
             batch: Input batch.
             batch_idx: Batch index.
         """
-        loss, log_dict = self.forward_and_get_loss(batch, prefix='val/')
-        self.log_dict(log_dict, 
-                      on_step=False, on_epoch=True, sync_dist=True,
-                      prog_bar=True)
+        if self._val_open_loop:
+            loss, log_dict = self.forward_and_get_loss(batch, prefix='val/')
+            self.log_dict(log_dict, 
+                        on_step=False, on_epoch=True, sync_dist=True,
+                        prog_bar=True)
+
+        if self._val_closed_loop:
+            step_len = self._step_len
+            future_len = self._future_len
+            pred_traj, pred_z, pred_head = [], [], []
+            for _ in range(self._n_rollout_closed_val):
+                traj = []
+                # z = []
+                head = []
+                for t in range((future_len+step_len-1) // step_len):
+                    print('closed-loop step', t)
+                    if t == 0:
+                        denoiser_outputs = self.sample_denoiser(batch)
+                        batch_ = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                    else:
+                        denoiser_outputs = self.sample_denoiser(batch_)
+                    
+                    # global frame
+                    pred_trajs = denoiser_outputs['denoised_trajs'][:, :, :step_len, :]  # [B, A, step_len, 5]
+                    
+                    if t == 1:
+                        pred_trajs_mid_step = denoiser_outputs['denoised_trajs']
+                        input_history = batch_['agents_history']
+
+                    batch_['agents_history'] = torch.cat(
+                        [batch_['agents_history'][:,:,-1:,:5], pred_trajs], dim=2
+                    )  # global frame
+                    batch_['agents_history'] = torch.cat(
+                        [batch_['agents_history'], batch['agents_history'][:, : , :, -4:]], dim=-1
+                    )
+
+                    batch_['relations'] = batch_calculate_relations(
+                        batch_['agents_history'], # global frame
+                        batch_['polylines'], # global frame
+                        batch_['traffic_light_points'], # global frame
+                        device=self.device
+                    )
+
+                    # batch_ = self.batch_to_device(batch_, self.device)
+
+                    traj.append(pred_trajs[:, :, :, :2])
+                    head.append(pred_trajs[:, :, :, 2])
+                    # z.append(batch['agents_history'][:, :, -1, 8])
+                pred_traj.append(torch.cat(traj, dim=-2))
+                # pred_z.append(z)
+                pred_head.append(torch.cat(head, dim=-1))
+
+            pred_traj = torch.stack(pred_traj, dim=1)
+            # pred_z = torch.stack(pred_z, dim=0)
+            pred_z = batch['agents_history'][:, :, -1, 8]
+            pred_z = pred_z.unsqueeze(-1).repeat(1, 1, future_len)
+            pred_z = pred_z.unsqueeze(1).repeat(1, self._n_rollout_closed_val, 1, 1)
+            pred_head = torch.stack(pred_head, dim=1)
+
+            simulated_states = torch.cat(
+                [pred_traj, pred_z.unsqueeze(-1), pred_head.unsqueeze(-1)], dim=-1
+            )  # [B, num_scenarios, A, future_len, 4]
+            print(simulated_states.shape)
+            
+            import pickle
+            import os
+            log_data = {
+                'agents_interested': batch_['agents_interested'].cpu().detach().numpy(),
+                'simulated_states': simulated_states.cpu().detach().numpy(),
+                'agents_future': batch_['agents_future'].cpu().detach().numpy() if hasattr(batch['agents_future'], 'cpu') else batch['agents_future'],
+                'polylines': batch_['polylines'].cpu().detach().numpy() if hasattr(batch['polylines'], 'cpu') else batch['polylines'],
+                'pred_trajs_mid_step': pred_trajs_mid_step.cpu().detach().numpy(),
+                'input_history': input_history.cpu().detach().numpy(),
+            }
+            
+            # 确保日志目录存在
+            log_dir = '/home/zhanghailiang/Repos/catk/logs'
+            os.makedirs(log_dir, exist_ok=True)
+            
+            log_file_path = os.path.join(log_dir, 'test.pkl')
+            with open(log_file_path, 'wb') as f:
+                pickle.dump(log_data, f)
+            
+            if isinstance(self.wosac_metrics, WOSACMetric):
+                self.wosac_metrics.update(
+                scenario_id=batch["scenario_id"],
+                gt_scenarios=batch["gt_scenario"],
+                agent_id=batch["agent"]["id"],
+                agent_batch=batch["agent"]["batch"],
+                simulated_states=simulated_states,
+            )
+            else:
+                scenario_rollouts = get_scenario_rollouts(
+                    scenario_id=get_scenario_id_int_tensor(
+                        batch["scenario_id"], self.device
+                    ),
+                    agent_id=batch["agents_id"],
+                    simulated_states=simulated_states,
+                )
+                self.wosac_metrics.update(batch["tfrecord_path"], scenario_rollouts)
         
         return loss
 
+    def test_step(self, batch, batch_idx):
+        pass
+
+    def on_validation_epoch_end(self):
+        if self._val_closed_loop:
+            epoch_wosac_metrics = self.wosac_metrics.compute()
+            # epoch_wosac_metrics["val_closed/ADE"] = self.minADE.compute()
+            if self.global_rank == 0:
+                epoch_wosac_metrics["epoch"] = (
+                    self.log_epoch if self.log_epoch >= 0 else self.current_epoch
+                )
+                self.logger.log_metrics(epoch_wosac_metrics)
+
+            self.wosac_metrics.reset()
+            # self.minADE.reset()
+
+            if self.global_rank == 0:
+                if self.wosac_submission.is_active:
+                    self.wosac_submission.save_sub_file()
+
+    def on_test_epoch_end(self):
+        pass
+
     ################### Loss function ###################
     def denoise_loss(
-            self, denoised_trajs,
-            agents_future, agents_future_valid,
+            self, 
+            denoised_trajs,
+            agents_future, 
+            agents_future_valid,
             agents_interested
         ):
             """
@@ -476,7 +746,7 @@ class VBD(pl.LightningModule):
             yaw_loss_mean = yaw_loss.sum() / future_mask.sum()
             
             return state_loss_mean, yaw_loss_mean
-        
+
     def action_loss(
         self, actions, actions_gt, actions_valid, agents_interested
     ):
@@ -503,7 +773,7 @@ class VBD(pl.LightningModule):
         action_loss_mean = action_loss.sum() / action_mask.sum()
         
         return action_loss_mean
-    
+
     def goal_loss(
         self, trajs, scores, agents_future,
         agents_future_valid, anchors,
@@ -597,7 +867,7 @@ class VBD(pl.LightningModule):
             denoise_FDE = denoise_mse[...,-1][gt_mask[...,-1]].mean()
             
             return denoise_ADE.item(), denoise_FDE.item()
-    
+
     @torch.no_grad()
     def calculate_metrics_predict(self,
             goal_trajs, agents_future, agents_future_valid,
@@ -636,7 +906,7 @@ class VBD(pl.LightningModule):
             goal_FDE = best_goal_mse[..., -1].sum()/gt_mask[..., -1].sum()
             
             return goal_ADE.item(), goal_FDE.item()
-    
+
     ################### Helper Functions ##############
     def batch_to_device(self, input_dict: dict, device: torch.device = 'cuda'):
         """
@@ -666,7 +936,7 @@ class VBD(pl.LightningModule):
             The normalized actions.
         """
         return (actions - self.action_mean) / self.action_std
-    
+
     def unnormalize_actions(self, actions: torch.Tensor):
         """
         Unnormalize the given actions using the stored action standard deviation and mean.
@@ -678,4 +948,3 @@ class VBD(pl.LightningModule):
              The unnormalized actions.
         """
         return actions * self.action_std + self.action_mean
-    

@@ -6,6 +6,7 @@ import glob
 import numpy as np
 from torch.utils.data import Dataset
 from .data_utils import *
+from types import SimpleNamespace
 import functools
 import pickle
 
@@ -256,6 +257,8 @@ class VBDDataset(Dataset):
             self, 
             vbd_data_dir, 
             anchor_path = "data/cluster_64_center_dict.pkl",
+            val_tfrecords_splitted=None,
+            val_gt_scenario_dir=None,
         ):
         """
         Data class for transforming smart data to vbd input format.
@@ -267,6 +270,8 @@ class VBDDataset(Dataset):
         self.file_list = glob.glob(vbd_data_dir+'/*') if vbd_data_dir is not None else []
 
         self.anchors = pickle.load(open(anchor_path, "rb"))
+        self._tfrecord_dir = val_tfrecords_splitted
+        self._gt_scenario_dir = val_gt_scenario_dir
         
         self.__collate_fn__ = data_collate_fn
     
@@ -276,7 +281,16 @@ class VBDDataset(Dataset):
     def __getitem__(self, idx):
         with open(self.file_list[idx], 'rb') as f:
             data = pickle.load(f)
-        return self.convert_to_tensor(data)
+        data = self.convert_to_tensor(data)
+        if self._tfrecord_dir is not None:
+            data["tfrecord_path"] = (
+                self._tfrecord_dir / (data["scenario_id"] + ".tfrecords")
+            ).as_posix()
+        if self._gt_scenario_dir is not None:
+            gt_path = self._gt_scenario_dir / f"{data['scenario_id']}.pkl"
+            with open(gt_path, "rb") as handle:
+                data["gt_scenario"] = SimpleNamespace(value=pickle.load(handle))
+        return data
     
     def _process(self, types):
         """
@@ -316,22 +330,27 @@ class VBDDataset(Dataset):
         agents_history = data['agents_history']
         agents_interested = data['agents_interested']
         agents_future = data['agents_future']
+        agents_future_valid = data['agents_future_valid']
         agents_type = data['agents_type']
         traffic_light_points = data['traffic_light_points']
         polylines = data['polylines']
         polylines_valid = data['polylines_valid']
         relations = data['relations']
+        agents_id = data['agents_id']
         anchors = self._process(agents_type)
 
         tensors = {
             "agents_history": torch.from_numpy(agents_history),
             "agents_interested": torch.from_numpy(agents_interested),
             "agents_future": torch.from_numpy(agents_future),
+            "agents_future_valid": torch.from_numpy(agents_future_valid),
             "agents_type": torch.from_numpy(agents_type),
             "traffic_light_points": torch.from_numpy(traffic_light_points),
             "polylines": torch.from_numpy(polylines),
             "polylines_valid": torch.from_numpy(polylines_valid),
             "relations": torch.from_numpy(relations),
-            "anchors": torch.from_numpy(anchors)
+            "anchors": torch.from_numpy(anchors),
+            'agents_id': torch.from_numpy(agents_id),
+            "scenario_id": data['scenario_id'],
         }
         return tensors

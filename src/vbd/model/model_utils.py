@@ -77,8 +77,8 @@ def batch_transform_trajs_to_global_frame(trajs, current_states):
     Batch transform trajectories to the global frame of reference.
 
     Args:
-        trajs (torch.Tensor): Trajectories tensor of shape [B, N, x, 2 or 3].
-        current_states (torch.Tensor): Current states tensor of shape [B, N, 5].
+        trajs (torch.Tensor): Trajectories tensor of shape [B, N, x, 2 or 3 or 5].
+        current_states (torch.Tensor): Current states tensor of shape [B, N, >=3].
 
     Returns:
         torch.Tensor: Transformed trajectories in the global frame. [B, N, x, 3]
@@ -89,13 +89,22 @@ def batch_transform_trajs_to_global_frame(trajs, current_states):
     g_y = trajs[..., 0] * torch.sin(theta[:, :, None]) + trajs[..., 1] * torch.cos(theta[:, :,  None])
     x = g_x + x[:, :, None]
     y = g_y + y[:, :, None]
-        
+    
     if trajs.shape[-1] == 2:
         trajs = torch.stack([x, y], dim=-1)
-    else:
+    elif trajs.shape[-1] == 3:
         theta = trajs[..., 2] + theta[:, :, None]
         theta = wrap_angle(theta)
         trajs = torch.stack([x, y, theta], dim=-1)
+    else:
+        local_v_x = trajs[..., 3]
+        local_v_y = trajs[..., 4]
+        v_x = local_v_x * torch.cos(theta[:, :, None]) - local_v_y * torch.sin(theta[:, :, None])
+        v_y = local_v_x * torch.sin(theta[:, :, None]) + local_v_y * torch.cos(theta[:, :, None])
+        # print(x.shape,y.shape,theta.shape,v_x.shape, v_y.shape)
+        theta = trajs[..., 2] + theta[:, :, None]
+        theta = wrap_angle(theta)
+        trajs = torch.stack([x, y, theta, v_x, v_y], dim=-1)
 
     return trajs
 
@@ -194,8 +203,9 @@ def roll_out(
         v = torch.sqrt(v_x**2 + v_y**2)
 
         a = actions[..., 0].repeat_interleave(action_len, dim=-1) 
-        v = v.unsqueeze(-1) + torch.cumsum(a * dt, dim=-1) 
-        v += torch.randn_like(v) * 0.1
+        v = v.unsqueeze(-1) + torch.cumsum(a * dt, dim=-1)
+        # TODO: this noise may be unnecessary
+        # v += torch.randn_like(v) * 0.1
         v = torch.clamp(v, min=0)
 
         yaw_rate = actions[..., 1].repeat_interleave(action_len, dim=-1) 
@@ -219,4 +229,76 @@ def roll_out(
             x = torch.cumsum(v_x * dt, dim=-1)
             y = torch.cumsum(v_y * dt, dim=-1)
 
-        return torch.stack([x, y, theta, v_x, v_y], dim=-1)   
+        return torch.stack([x, y, theta, v_x, v_y], dim=-1)
+
+@torch.no_grad()
+def batch_calculate_relations(
+    agents_history: torch.Tensor,
+    polylines: torch.Tensor,
+    traffic_light_points: torch.Tensor,
+    device: str = 'cpu'
+):
+    """
+    Calculate relations between agents, polylines, and traffic light points.
+
+    Args:
+        agents_history (torch.Tensor): Agent history tensor of shape [B, N, T, 3]. [x, y, theta]
+        polylines (torch.Tensor): Polylines tensor of shape [B, N, T, 2]. [x, y]
+        traffic_light_points (torch.Tensor): Traffic light points tensor of shape [B, N, T, 2]. [x, y]
+
+    Returns:
+        torch.Tensor: Relations tensor of shape [B, N, T, N]. [1 if the two agents are in the same lane, 0 otherwise]
+    """
+    batch_size = agents_history.shape[0]
+    n_agents = agents_history.shape[1]
+    n_polylines = polylines.shape[1]
+    n_traffic_lights = traffic_light_points.shape[1]
+    n = n_agents + n_polylines + n_traffic_lights
+    
+    # Prepare a single array to hold all elements
+    all_elements = torch.concatenate([
+        agents_history[:, :, -1, :3],
+        polylines[:, :, 0, :3],
+        torch.concatenate(
+            [
+                traffic_light_points[:, :, :2], 
+                torch.zeros((batch_size, n_traffic_lights, 1), device=device)
+            ], axis=2
+        )
+    ], axis=1)
+    
+    # Compute pairwise differences using broadcasting
+    pos_diff = all_elements[:, :, :2][:, :, None, :] - all_elements[:, :, :2][:, None, :, :]
+    
+    # Compute local position and angle differences
+    cos_theta = torch.cos(all_elements[:, :, 2])[:, :, None]
+    sin_theta = torch.sin(all_elements[:, :, 2])[:, :, None]
+    local_pos_x = pos_diff[..., 0] * cos_theta + pos_diff[..., 1] * sin_theta
+    local_pos_y = -pos_diff[..., 0] * sin_theta + pos_diff[..., 1] * cos_theta
+    theta_diff = wrap_angle(all_elements[:, :, 2][:, :, None] - all_elements[:, :, 2][:, None, :])
+    
+    # Set theta_diff to zero for traffic lights
+    start_idx = n_agents + n_polylines
+    mask = (torch.arange(n, device=device) >= start_idx).repeat(batch_size, 1)
+    
+    theta_diff = torch.where(
+        mask[:, :, None] | mask[:, None, :], 
+        0, theta_diff
+    )
+    
+    # Set the diagonal of the differences to a very small value
+    diag_mask = torch.eye(n, dtype=bool, device=device)
+    epsilon = 0.01
+    local_pos_x = torch.where(diag_mask, epsilon, local_pos_x)
+    local_pos_y = torch.where(diag_mask, epsilon, local_pos_y)
+    theta_diff = torch.where(diag_mask, epsilon, theta_diff)
+    
+    # Conditions for zero coordinates
+    zero_mask = torch.logical_or(all_elements[:, :, 0][:, :, None] == 0, all_elements[:, :, 0][:, None, :] == 0)
+    
+    relations = torch.stack([local_pos_x, local_pos_y, theta_diff], dim=-1)
+    
+    # Apply zero mask
+    relations = torch.where(zero_mask[..., None], 0.0, relations)
+    
+    return relations

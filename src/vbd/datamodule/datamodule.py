@@ -17,6 +17,8 @@ class VBDDataModule(LightningDataModule):
         train_raw_dir: str,
         val_raw_dir: str,
         test_raw_dir: str,
+        val_tfrecords_splitted: str,
+        val_gt_scenario_dir: str,
         shuffle: bool,
         num_workers: int,
         pin_memory: bool,
@@ -34,6 +36,10 @@ class VBDDataModule(LightningDataModule):
         self.train_raw_dir = train_raw_dir
         self.val_raw_dir = val_raw_dir
         self.test_raw_dir = test_raw_dir
+
+        self.val_tfrecords_splitted = val_tfrecords_splitted
+        self.val_gt_scenario_dir = val_gt_scenario_dir
+        self.anchor_path = anchor_path
 
     def setup(self, stage: Optional[str] = None) -> None:
         if stage == "fit" or stage is None:

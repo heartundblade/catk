@@ -1,1 +1,1 @@
-from datamodule import VBDDataModule
+from src.vbd.datamodule.datamodule import VBDDataModule
