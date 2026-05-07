@@ -16,7 +16,8 @@ from src.vbd.data_preprocess.data_preprocess import calculate_relations
 from torch.nn.functional import smooth_l1_loss, cross_entropy
 from src.smart.metrics import (
     WOSACMetric,
-    WOSACMetrics
+    WOSACMetrics,
+    WOSACSubmission
 )
 from src.utils.wosac_utils import get_scenario_rollouts, get_scenario_id_int_tensor
 
@@ -94,6 +95,8 @@ class VBD(pl.LightningModule):
             self.wosac_metrics = WOSACMetric('2024')
         else:
             self.wosac_metrics = WOSACMetrics("val_closed")
+        
+        self.wosac_submission = WOSACSubmission(**cfg['wosac_submission'])
 
         self.register_buffer('action_mean', torch.tensor(self._action_mean))  
         self.register_buffer('action_std', torch.tensor(self._action_std))
@@ -586,11 +589,12 @@ class VBD(pl.LightningModule):
             future_len = self._future_len
             pred_traj, pred_z, pred_head = [], [], []
             for _ in range(self._n_rollout_closed_val):
+                print('closed-loop rollout', _)
                 traj = []
                 # z = []
                 head = []
                 for t in range((future_len+step_len-1) // step_len):
-                    print('closed-loop step', t)
+                    # print('closed-loop step', t)
                     if t == 0:
                         denoiser_outputs = self.sample_denoiser(batch)
                         batch_ = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
@@ -636,8 +640,8 @@ class VBD(pl.LightningModule):
 
             simulated_states = torch.cat(
                 [pred_traj, pred_z.unsqueeze(-1), pred_head.unsqueeze(-1)], dim=-1
-            )  # [B, num_scenarios, A, future_len, 4]
-            print(simulated_states.shape)
+            )  # [B, n_rollout, A, future_len, 4]
+            # print(simulated_states.shape)
             
             import pickle
             import os
@@ -662,8 +666,7 @@ class VBD(pl.LightningModule):
                 self.wosac_metrics.update(
                 scenario_id=batch["scenario_id"],
                 gt_scenarios=batch["gt_scenario"],
-                agent_id=batch["agent"]["id"],
-                agent_batch=batch["agent"]["batch"],
+                agent_id=batch["agents_id"],
                 simulated_states=simulated_states,
             )
             else:

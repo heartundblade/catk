@@ -59,5 +59,14 @@ cfg:
   val_closed_loop: true
   fast_wosac_metric: False
 
-  n_rollout_closed_val: 2
+  n_rollout_closed_val: 32
   step_len: 10
+
+  wosac_submission:
+    is_active: false
+    method_name: "SMART-tiny-CLSFT"
+    authors: [Anonymous]
+    affiliation: YOUR_AFFILIATION
+    description: YOUR_DESCRIPTION
+    method_link: YOUR_METHOD_LINK
+    account_name: YOUR_ACCOUNT_NAME

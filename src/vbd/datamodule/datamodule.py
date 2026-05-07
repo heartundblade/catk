@@ -50,11 +50,15 @@ class VBDDataModule(LightningDataModule):
             self.val_dataset = VBDDataset(
                 vbd_data_dir=self.val_raw_dir,
                 anchor_path=self.anchor_path,
+                val_tfrecords_splitted=self.val_tfrecords_splitted,
+                val_gt_scenario_dir=self.val_gt_scenario_dir,
             )
         elif stage == "validate":
             self.val_dataset = VBDDataset(
                 vbd_data_dir=self.val_raw_dir,
                 anchor_path=self.anchor_path,
+                val_tfrecords_splitted=self.val_tfrecords_splitted,
+                val_gt_scenario_dir=self.val_gt_scenario_dir,
             )
         elif stage == "test":
             self.test_dataset = VBDDataset(

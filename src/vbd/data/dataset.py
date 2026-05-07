@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import functools
 import pickle
 
+from pathlib import Path
 
 class WaymaxDataset(Dataset):
     """
@@ -270,8 +271,8 @@ class VBDDataset(Dataset):
         self.file_list = glob.glob(vbd_data_dir+'/*') if vbd_data_dir is not None else []
 
         self.anchors = pickle.load(open(anchor_path, "rb"))
-        self._tfrecord_dir = val_tfrecords_splitted
-        self._gt_scenario_dir = val_gt_scenario_dir
+        self._tfrecord_dir = Path(val_tfrecords_splitted) if val_tfrecords_splitted is not None else None
+        self._gt_scenario_dir = Path(val_gt_scenario_dir) if val_gt_scenario_dir is not None else None
         
         self.__collate_fn__ = data_collate_fn
     

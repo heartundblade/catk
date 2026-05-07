@@ -74,6 +74,61 @@ def get_scenario_rollouts(
 
     return scenario_rollouts
 
+def get_scenario_rollouts(
+    scenario_id: Tensor,  # [n_scenario, n_str_length]
+    agent_id: Tensor,  # [n_scenario, n_agent]
+    simulated_states: Tensor,  # [B, n_rollout, n_agent, n_step, 4]
+) -> List[sim_agents_submission_pb2.ScenarioRollouts]:
+    scenario_id = scenario_id.cpu().numpy()
+    # agent_id = _unbatch(agent_id, agent_batch)
+    # pred_traj = _unbatch(pred_traj, agent_batch)
+    # pred_z = _unbatch(pred_z, agent_batch)
+    # pred_head = _unbatch(pred_head, agent_batch)
+    pred_traj = simulated_states[..., :2]
+    pred_z = simulated_states[..., 2]
+    pred_head = simulated_states[..., 3]
+    # print(pred_traj.shape)
+    # print(pred_z.shape)
+    # print(pred_head.shape)
+    # print(agent_id.shape)
+    agent_id = [x.cpu().numpy() for x in agent_id]
+    pred_traj = [x.cpu().numpy() for x in pred_traj]
+    pred_z = [x.cpu().numpy() for x in pred_z]
+    pred_head = [x.cpu().numpy() for x in pred_head]
+
+    n_scenario = scenario_id.shape[0]
+    n_rollout = pred_traj[0].shape[0]
+    scenario_rollouts = []
+    for i_scenario in range(n_scenario):
+        joint_scenes = []
+        for i_rollout in range(n_rollout):
+            simulated_trajectories = []
+            for i_agent in range(len(agent_id[i_scenario])):
+                if agent_id[i_scenario][i_agent] == 0:
+                    continue
+                simulated_trajectories.append(
+                    sim_agents_submission_pb2.SimulatedTrajectory(
+                        center_x=pred_traj[i_scenario][i_rollout, i_agent, :, 0],
+                        center_y=pred_traj[i_scenario][i_rollout, i_agent, :, 1],
+                        center_z=pred_z[i_scenario][i_rollout, i_agent],
+                        heading=pred_head[i_scenario][i_rollout, i_agent],
+                        object_id=agent_id[i_scenario][i_agent],
+                    )
+                )
+            joint_scenes.append(
+                sim_agents_submission_pb2.JointScene(
+                    simulated_trajectories=simulated_trajectories
+                )
+            )
+
+        _str_scenario_id = "".join([chr(x) for x in scenario_id[i_scenario] if x > 0])
+        scenario_rollouts.append(
+            sim_agents_submission_pb2.ScenarioRollouts(
+                joint_scenes=joint_scenes, scenario_id=_str_scenario_id
+            )
+        )
+
+    return scenario_rollouts
 
 def get_scenario_id_int_tensor(scenario_id: List[str], device: torch.device) -> Tensor:
     scenario_id_int_tensor = []
