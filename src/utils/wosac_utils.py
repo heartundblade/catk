@@ -104,7 +104,7 @@ def get_scenario_rollouts(
         for i_rollout in range(n_rollout):
             simulated_trajectories = []
             for i_agent in range(len(agent_id[i_scenario])):
-                if agent_id[i_scenario][i_agent] == 0:
+                if agent_id[i_scenario][i_agent] < -0.5:
                     continue
                 simulated_trajectories.append(
                     sim_agents_submission_pb2.SimulatedTrajectory(

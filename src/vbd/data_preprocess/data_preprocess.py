@@ -384,6 +384,9 @@ def process_agents(
     tracks = scenario.tracks
     sdc_idx = scenario.sdc_track_index
 
+    tracks_to_predict = scenario.tracks_to_predict
+    tracks_to_predict_idx = [t.track_index for t in tracks_to_predict]
+
     # select agents based on distance to sdc
     sdc_position = np.array(
         [
@@ -391,6 +394,9 @@ def process_agents(
             tracks[sdc_idx].states[current_index].center_y
         ]
     )
+
+    # tracks = [t for t in tracks if t.states[current_index].valid]
+
     agents_positions = []
     if select_agents is None:
         for i, cur_data in enumerate(tracks):
@@ -403,8 +409,15 @@ def process_agents(
         distance_to_sdc = np.linalg.norm(
             np.array(agents_positions) - sdc_position, axis=-1
             )
-        agents_idx = np.argsort(distance_to_sdc)[:max_num_objects]
-        agents_idx = np.sort(agents_idx)
+        # agents_idx = np.argsort(distance_to_sdc)[:max_num_objects]
+        # agents_idx = np.sort(agents_idx)
+
+        all_sorted_idx = np.argsort(distance_to_sdc)     
+        
+        remaining_idx = [idx for idx in all_sorted_idx if idx not in tracks_to_predict_idx]
+        combined_idx = tracks_to_predict_idx + remaining_idx
+        
+        agents_idx = np.array(combined_idx[:max_num_objects])
     else:
         agents_idx = select_agents
 
@@ -413,7 +426,7 @@ def process_agents(
     agents_type = np.zeros((max_num_objects,), dtype=np.int32)
     agents_interested = np.zeros((max_num_objects,), dtype=np.int32)
     agents_future = np.zeros((max_num_objects, num_steps-current_index, 9), dtype=np.float32)
-    agents_id = np.zeros((max_num_objects,), dtype=np.int32)
+    agents_id = np.ones((max_num_objects,), dtype=np.int32)*(-1)
     
     agents_idx_list = agents_idx.tolist()
     for i, cur_data in enumerate([tracks[idx] for idx in agents_idx_list]):
@@ -457,7 +470,7 @@ def process_agents(
         
         agents_history[i] = step_state[:current_index+1]
         agents_history[i][~step_valid[:current_index+1]] = 0
-        if step_state.shape[0]<num_steps:
+        if step_state.shape[0] < num_steps:
             continue
         else:
             agents_future[i] = step_state[current_index:]
@@ -660,9 +673,20 @@ def data_process_scenario(
         use_log: bool=True,
         select_agents: List[int] = None,
         remove_history: bool=False,
+        split: str='train',
     ) -> Dict[str, Any]:
     data = {}
 
+    # if split == 'validation':
+    #     agents_data = process_agents(
+    #         scenario,
+    #         max_num_objects=256,
+    #         num_steps=91,
+    #         current_index=current_index,
+    #         select_agents=select_agents,
+    #         remove_history=remove_history,
+    #     )
+    # else:
     agents_data = process_agents(
         scenario,
         max_num_objects=max_num_objects,
@@ -727,6 +751,7 @@ def wm2vbd(
             max_polylines=MAX_POLYLINES,
             current_index=CURRENT_INDEX,
             num_points_polyline=NUM_POINTS_POLYLINE,
+            split=split,
         )
         
         scenario_id = scenario.scenario_id
