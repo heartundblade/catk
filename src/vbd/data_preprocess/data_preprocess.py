@@ -394,11 +394,12 @@ def process_agents(
         ]
     )
 
-    tracks = [t for t in tracks if t.states[current_index].valid]
+    valid_indices = [i for i, t in enumerate(tracks) if t.states[current_index].valid]
 
     agents_positions = []
     agents_velocities = []
-    for i, cur_data in enumerate(tracks):
+    for idx in valid_indices:
+        cur_data = tracks[idx]
         agents_positions.append(
             [
                 cur_data.states[current_index].center_x,
@@ -422,9 +423,10 @@ def process_agents(
     # agents_idx = np.argsort(distance_to_sdc)[:max_num_objects]
     # agents_idx = np.sort(agents_idx)
 
-    all_sorted_idx = np.argsort(distance_to_sdc)     
+    sorted_idx = np.argsort(distance_to_sdc)     
+    sorted_original_idx = [valid_indices[idx] for idx in sorted_idx]
     
-    remaining_idx = [idx for idx in all_sorted_idx if idx not in tracks_to_predict_idx]
+    remaining_idx = [idx for idx in sorted_original_idx if idx not in tracks_to_predict_idx]
     combined_idx = tracks_to_predict_idx + remaining_idx
     
     # agents_idx = np.array(combined_idx[:max_num_objects])
@@ -757,7 +759,6 @@ def data_process_scenario(
     )
     relations = relations.astype(np.float32)
 
-    # TODO: add agents_future_valid
     data = {
         'agents_history': agents_data['history'],
         'agents_future': agents_data['future'],
@@ -811,7 +812,7 @@ def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
 
     input_dir = Path(input_dir) / split
     packages = sorted([p.as_posix() for p in input_dir.glob("*")])
-    packages = packages[:5]
+    packages = packages[:50]
 
     func = partial(
         wm2vbd,

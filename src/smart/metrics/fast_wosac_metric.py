@@ -81,15 +81,32 @@ class WOSACMetric(Metric):
         scenario_id: Iterable[str],
         gt_scenarios: Iterable[dict],
         agent_id: Tensor,
-        agent_batch: Tensor,
         simulated_states: Tensor,
+        agent_batch: Optional[Tensor] = None,
     ) -> None:
+        """
+        Update metrics with scenario data.
+        
+        Args:
+            scenario_id: Iterable of scenario IDs
+            gt_scenarios: Iterable of ground truth scenario dictionaries
+            agent_id: Agent IDs tensor (can be batched or unbatched)
+            simulated_states: Simulated states tensor
+            agent_batch: Optional batch index tensor for un-batching (required for batched inputs)
+        """
 
-        device = simulated_states.device
+        device = simulated_states[0].device
         scenario_ids = list(scenario_id)
         gt_scenarios = list(gt_scenarios)
-        agent_ids = self._unbatch_agents(agent_id, agent_batch, dim=0)
-        sim_states = self._unbatch_agents(simulated_states, agent_batch, dim=1)
+        
+        if agent_batch is not None:
+            # Batched input: need to unbatch using agent_batch
+            agent_ids = self._unbatch_agents(agent_id, agent_batch, dim=0)
+            sim_states = self._unbatch_agents(simulated_states, agent_batch, dim=1)
+        else:
+            # Unbatched input: already in per-scenario format
+            agent_ids = [x for x in agent_id]
+            sim_states = [x for x in simulated_states]
 
         for idx, _ in enumerate(scenario_ids):
             gt_scenario = _unwrap_gt_scenario(gt_scenarios[idx])
