@@ -77,6 +77,7 @@ class VBDDataModule(LightningDataModule):
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
             drop_last=False,
+            collate_fn=self.train_dataset.__collate_fn__,
         )
 
     def val_dataloader(self) -> EVAL_DATALOADERS:
@@ -88,6 +89,7 @@ class VBDDataModule(LightningDataModule):
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
             drop_last=False,
+            collate_fn=self.val_dataset.__collate_fn__,
         )
 
     def test_dataloader(self) -> EVAL_DATALOADERS:
@@ -99,4 +101,5 @@ class VBDDataModule(LightningDataModule):
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
             drop_last=False,
+            collate_fn=self.test_dataset.__collate_fn__,
         )

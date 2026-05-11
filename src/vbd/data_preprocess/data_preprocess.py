@@ -378,7 +378,6 @@ def process_agents(
         max_num_objects=64,
         num_steps=91,
         current_index=10,  # current timestamp
-        select_agents=None,
         remove_history=False,
     ):
     tracks = scenario.tracks
@@ -395,41 +394,53 @@ def process_agents(
         ]
     )
 
-    # tracks = [t for t in tracks if t.states[current_index].valid]
+    tracks = [t for t in tracks if t.states[current_index].valid]
 
     agents_positions = []
-    if select_agents is None:
-        for i, cur_data in enumerate(tracks):
-            agents_positions.append(
-                [
-                    cur_data.states[current_index].center_x,
-                    cur_data.states[current_index].center_y
-                ]
-            )
-        distance_to_sdc = np.linalg.norm(
-            np.array(agents_positions) - sdc_position, axis=-1
-            )
-        # agents_idx = np.argsort(distance_to_sdc)[:max_num_objects]
-        # agents_idx = np.sort(agents_idx)
+    agents_velocities = []
+    for i, cur_data in enumerate(tracks):
+        agents_positions.append(
+            [
+                cur_data.states[current_index].center_x,
+                cur_data.states[current_index].center_y
+            ]
+        )
+        agents_velocities.append(
+            [
+                cur_data.states[current_index].velocity_x,
+                cur_data.states[current_index].velocity_y
+            ]
+        )
+    
+    distance_to_sdc = np.linalg.norm(
+        np.array(agents_positions) - sdc_position, axis=-1
+    )
+    
+    velocity_magnitude = np.linalg.norm(np.array(agents_velocities), axis=-1)
+    distance_to_sdc[velocity_magnitude < 1e-5] += 100
 
-        all_sorted_idx = np.argsort(distance_to_sdc)     
-        
-        remaining_idx = [idx for idx in all_sorted_idx if idx not in tracks_to_predict_idx]
-        combined_idx = tracks_to_predict_idx + remaining_idx
-        
-        agents_idx = np.array(combined_idx[:max_num_objects])
-    else:
-        agents_idx = select_agents
+    # agents_idx = np.argsort(distance_to_sdc)[:max_num_objects]
+    # agents_idx = np.sort(agents_idx)
 
-
+    all_sorted_idx = np.argsort(distance_to_sdc)     
+    
+    remaining_idx = [idx for idx in all_sorted_idx if idx not in tracks_to_predict_idx]
+    combined_idx = tracks_to_predict_idx + remaining_idx
+    
+    # agents_idx = np.array(combined_idx[:max_num_objects])
+    agents_idx = combined_idx[:max_num_objects]
+    agents_idx_remaining = []
+    if len(combined_idx) > max_num_objects:
+        agents_idx_remaining = combined_idx[max_num_objects:]
+    
     agents_history = np.zeros((max_num_objects, current_index+1, 9), dtype=np.float32)
     agents_type = np.zeros((max_num_objects,), dtype=np.int32)
     agents_interested = np.zeros((max_num_objects,), dtype=np.int32)
     agents_future = np.zeros((max_num_objects, num_steps-current_index, 9), dtype=np.float32)
     agents_id = np.ones((max_num_objects,), dtype=np.int32)*(-1)
     
-    agents_idx_list = agents_idx.tolist()
-    for i, cur_data in enumerate([tracks[idx] for idx in agents_idx_list]):
+    # agents_idx_list = agents_idx.tolist()
+    for i, cur_data in enumerate([tracks[idx] for idx in agents_idx]):
         agent_type = cur_data.object_type
         agent_id = cur_data.id
         valid = cur_data.states[current_index].valid
@@ -475,7 +486,37 @@ def process_agents(
         else:
             agents_future[i] = step_state[current_index:]
         agents_future[i][~step_valid[current_index:]] = 0
-    
+
+    agents_history_remaining = np.zeros((len(agents_idx_remaining), current_index+1, 9), dtype=np.float32)
+    agents_id_remaining = np.ones((len(agents_idx_remaining),), dtype=np.int32)*(-1)
+    for i, cur_data in enumerate([tracks[idx] for idx in agents_idx_remaining]):
+        agent_id = cur_data.id
+        agents_id_remaining[i] = agent_id
+
+        step_state = []
+        step_valid = []
+        for s in cur_data.states:
+            step_state.append(
+                [
+                    s.center_x,
+                    s.center_y,
+                    s.heading,
+                    s.velocity_x,
+                    s.velocity_y,
+                    s.length,
+                    s.width,
+                    s.height,
+                    s.center_z,
+                ]
+            )
+            step_valid.append(s.valid)
+        
+        step_state = np.array(step_state, dtype=np.float32)
+        step_valid = np.array(step_valid, dtype=bool)
+
+        agents_history_remaining[i] = step_state[:current_index+1]
+        agents_history_remaining[i][~step_valid[:current_index+1]] = 0
+
     agents_future_valid = np.not_equal(
         np.sum(agents_future, axis=-1), 0
     )
@@ -489,7 +530,9 @@ def process_agents(
         'future_valid': agents_future_valid,
         'interested': agents_interested,
         'type': agents_type,
-        'ids': agents_id
+        'ids': agents_id,
+        'history_remaining': agents_history_remaining,
+        'ids_remaining': agents_id_remaining,
     }
 
 def process_traffic_lights(
@@ -671,7 +714,6 @@ def data_process_scenario(
         current_index: int=10,
         num_points_polyline: int=30,
         use_log: bool=True,
-        select_agents: List[int] = None,
         remove_history: bool=False,
         split: str='train',
     ) -> Dict[str, Any]:
@@ -692,7 +734,6 @@ def data_process_scenario(
         max_num_objects=max_num_objects,
         num_steps=91,
         current_index=current_index,
-        select_agents=select_agents,
         remove_history=remove_history,
     )
     
@@ -727,7 +768,9 @@ def data_process_scenario(
         'polylines': roadgraph_data['polylines'],
         'polylines_valid': roadgraph_data['polylines_valid'],
         'relations': relations,
-        'agents_id': agents_data['ids']
+        'agents_id': agents_data['ids'],
+        'agents_history_remaining': agents_data['history_remaining'],
+        'agents_id_remaining': agents_data['ids_remaining'],
     }
     return data
 

@@ -74,27 +74,27 @@ def get_scenario_rollouts(
 
     return scenario_rollouts
 
-def get_scenario_rollouts(
+def get_scenario_rollouts_vbd(
     scenario_id: Tensor,  # [n_scenario, n_str_length]
-    agent_id: Tensor,  # [n_scenario, n_agent]
-    simulated_states: Tensor,  # [B, n_rollout, n_agent, n_step, 4]
+    agent_id: List[Tensor],  # [n_scenario][n_agent]
+    simulated_states: List[Tensor],  # [n_scenario][n_rollout, n_agent, n_step, 4]
 ) -> List[sim_agents_submission_pb2.ScenarioRollouts]:
     scenario_id = scenario_id.cpu().numpy()
     # agent_id = _unbatch(agent_id, agent_batch)
     # pred_traj = _unbatch(pred_traj, agent_batch)
     # pred_z = _unbatch(pred_z, agent_batch)
     # pred_head = _unbatch(pred_head, agent_batch)
-    pred_traj = simulated_states[..., :2]
-    pred_z = simulated_states[..., 2]
-    pred_head = simulated_states[..., 3]
+    # pred_traj = simulated_states[..., :2]
+    # pred_z = simulated_states[..., 2]
+    # pred_head = simulated_states[..., 3]
     # print(pred_traj.shape)
     # print(pred_z.shape)
     # print(pred_head.shape)
     # print(agent_id.shape)
     agent_id = [x.cpu().numpy() for x in agent_id]
-    pred_traj = [x.cpu().numpy() for x in pred_traj]
-    pred_z = [x.cpu().numpy() for x in pred_z]
-    pred_head = [x.cpu().numpy() for x in pred_head]
+    pred_traj = [x[..., :2].cpu().numpy() for x in simulated_states]
+    pred_z = [x[..., 2].cpu().numpy() for x in simulated_states]
+    pred_head = [x[..., 3].cpu().numpy() for x in simulated_states]
 
     n_scenario = scenario_id.shape[0]
     n_rollout = pred_traj[0].shape[0]

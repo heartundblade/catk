@@ -19,7 +19,7 @@ from src.smart.metrics import (
     WOSACMetrics,
     WOSACSubmission
 )
-from src.utils.wosac_utils import get_scenario_rollouts, get_scenario_id_int_tensor
+from src.utils.wosac_utils import get_scenario_rollouts_vbd, get_scenario_id_int_tensor
 
 class VBD(pl.LightningModule):
     """
@@ -587,6 +587,7 @@ class VBD(pl.LightningModule):
         if self._val_closed_loop:
             step_len = self._step_len
             future_len = self._future_len
+            batch_size = batch['agents_history'].shape[0]
             pred_traj, pred_z, pred_head = [], [], []
             for _ in range(self._n_rollout_closed_val):
                 print('closed-loop rollout', _)
@@ -643,39 +644,105 @@ class VBD(pl.LightningModule):
             )  # [B, n_rollout, A, future_len, 4]
             # print(simulated_states.shape)
             
-            import pickle
-            import os
-            log_data = {
-                'agents_interested': batch_['agents_interested'].cpu().detach().numpy(),
-                'simulated_states': simulated_states.cpu().detach().numpy(),
-                'agents_future': batch_['agents_future'].cpu().detach().numpy() if hasattr(batch['agents_future'], 'cpu') else batch['agents_future'],
-                'polylines': batch_['polylines'].cpu().detach().numpy() if hasattr(batch['polylines'], 'cpu') else batch['polylines'],
-                'pred_trajs_mid_step': pred_trajs_mid_step.cpu().detach().numpy(),
-                'input_history': input_history.cpu().detach().numpy(),
-            }
+            # import pickle
+            # import os
+            # log_data = {
+            #     'agents_interested': batch_['agents_interested'].cpu().detach().numpy(),
+            #     'simulated_states': simulated_states.cpu().detach().numpy(),
+            #     'agents_future': batch_['agents_future'].cpu().detach().numpy() if hasattr(batch['agents_future'], 'cpu') else batch['agents_future'],
+            #     'polylines': batch_['polylines'].cpu().detach().numpy() if hasattr(batch['polylines'], 'cpu') else batch['polylines'],
+            #     'pred_trajs_mid_step': pred_trajs_mid_step.cpu().detach().numpy(),
+            #     'input_history': input_history.cpu().detach().numpy(),
+            # }
             
-            # 确保日志目录存在
-            log_dir = '/home/zhanghailiang/Repos/catk/logs'
-            os.makedirs(log_dir, exist_ok=True)
+            # # 确保日志目录存在
+            # log_dir = '/home/zhanghailiang/Repos/catk/logs'
+            # os.makedirs(log_dir, exist_ok=True)
             
-            log_file_path = os.path.join(log_dir, 'test.pkl')
-            with open(log_file_path, 'wb') as f:
-                pickle.dump(log_data, f)
+            # log_file_path = os.path.join(log_dir, 'test.pkl')
+            # with open(log_file_path, 'wb') as f:
+            #     pickle.dump(log_data, f)
+            
+            # all_agents_id = batch["agents_id"].clone()
+            all_agents_id_list = [x for x in batch["agents_id"]]
+            simulated_states_list = [x for x in simulated_states]
+            for i in range(batch_size):
+                num_agents_remaining = batch['agents_history_remaining'][i].shape[0]
+                cur_data = batch['agents_history_remaining'][i].clone()  # [A, T(11), 9]
+                if num_agents_remaining > 0:
+                    all_agents_id_list[i] = torch.cat([all_agents_id_list[i], batch['agents_id_remaining'][i]], dim=0)
+                    # dims_sum = cur_data[..., 5:8].sum(dim=-1)  # [A, T]
+                    # valid = dims_sum >= 1e-5  # [A, T]
+
+                    simulated_states_remaining = torch.zeros((self._n_rollout_closed_val, num_agents_remaining, future_len, 4), device=self.device)
+                    states_current = cur_data[:, -1, :]  # [A, 9]
+                    
+                    pos = states_current[:, :2]  # [A, 2]
+                    heading = states_current[:, 2]  # [A]
+                    z = states_current[:, 8]  # [A]
+                    vel = states_current[:, 3:5]  # [A, 2]
+
+                    # 线性外推：pos[t] = pos_0 + vel * t，heading和z保持不变
+                    time_steps = torch.arange(future_len, device=self.device).float() * 0.1  # [future_len]
+                    
+                    # 位置线性外推: pos[t] = pos_0 + vel * t
+                    pos_expanded = pos.unsqueeze(1).unsqueeze(0)  # [1, A, 1, 2]
+                    vel_expanded = vel.unsqueeze(1).unsqueeze(0)  # [1, A, 1, 2]
+                    time_expanded = time_steps.unsqueeze(0).unsqueeze(0).unsqueeze(-1)  # [1, 1, future_len, 1]
+                    
+                    pred_pos = pos_expanded + vel_expanded * time_expanded  # [1, A, future_len, 2]
+                    
+                    # heading 和 z 保持不变，扩展到所有时间步和所有rollout
+                    heading_expanded = heading.unsqueeze(0).unsqueeze(-1).expand(
+                        self._n_rollout_closed_val, num_agents_remaining, future_len
+                    )  # [n_rollout, A, future_len]
+                    z_expanded = z.unsqueeze(0).unsqueeze(-1).expand(
+                        self._n_rollout_closed_val, num_agents_remaining, future_len
+                    )  # [n_rollout, A, future_len]
+                    
+                    # 格式: [n_rollout, A, future_len, 4]，4 对应 [x, y, z, heading]
+                    simulated_states_remaining[..., :2] = pred_pos.expand(
+                        self._n_rollout_closed_val, num_agents_remaining, future_len, 2
+                    )
+                    simulated_states_remaining[..., 2] = z_expanded  # z
+                    simulated_states_remaining[..., 3] = heading_expanded  # heading
+                    
+                    simulated_states_list[i] = torch.cat([simulated_states_list[i], simulated_states_remaining], dim=1)
+                    print(all_agents_id_list[i].shape)
+
+                    import pickle
+                    import os
+                    log_data = {
+                        'agents_interested': batch_['agents_interested'][i].cpu().detach().numpy(),
+                        'simulated_states': simulated_states_list[i].cpu().detach().numpy(),
+                        'agents_future': batch_['agents_future'][i].cpu().detach().numpy() if hasattr(batch['agents_future'], 'cpu') else batch['agents_future'],
+                        'polylines': batch_['polylines'][i].cpu().detach().numpy() if hasattr(batch_['polylines'], 'cpu') else batch['polylines'],
+                        'pred_trajs_mid_step': pred_trajs_mid_step.cpu().detach().numpy(),
+                        'input_history': input_history.cpu().detach().numpy(),
+                    }
+                    
+                    # 确保日志目录存在
+                    log_dir = '/home/zhanghailiang/Repos/catk/logs'
+                    os.makedirs(log_dir, exist_ok=True)
+                    
+                    log_file_path = os.path.join(log_dir, 'test.pkl')
+                    with open(log_file_path, 'wb') as f:
+                        pickle.dump(log_data, f)
             
             if isinstance(self.wosac_metrics, WOSACMetric):
                 self.wosac_metrics.update(
                 scenario_id=batch["scenario_id"],
                 gt_scenarios=batch["gt_scenario"],
-                agent_id=batch["agents_id"],
-                simulated_states=simulated_states,
+                agent_id=all_agents_id_list,
+                simulated_states=simulated_states_list,
             )
             else:
-                scenario_rollouts = get_scenario_rollouts(
+                scenario_rollouts = get_scenario_rollouts_vbd(
                     scenario_id=get_scenario_id_int_tensor(
                         batch["scenario_id"], self.device
                     ),
-                    agent_id=batch["agents_id"],
-                    simulated_states=simulated_states,
+                    agent_id=all_agents_id_list,
+                    simulated_states=simulated_states_list,
                 )
                 self.wosac_metrics.update(batch["tfrecord_path"], scenario_rollouts)
         

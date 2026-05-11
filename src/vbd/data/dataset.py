@@ -338,6 +338,8 @@ class VBDDataset(Dataset):
         polylines_valid = data['polylines_valid']
         relations = data['relations']
         agents_id = data['agents_id']
+        agents_history_remaining = data['agents_history_remaining']
+        agents_id_remaining = data['agents_id_remaining']
         anchors = self._process(agents_type)
 
         tensors = {
@@ -352,6 +354,8 @@ class VBDDataset(Dataset):
             "relations": torch.from_numpy(relations),
             "anchors": torch.from_numpy(anchors),
             'agents_id': torch.from_numpy(agents_id),
+            'agents_history_remaining': torch.from_numpy(agents_history_remaining),
+            'agents_id_remaining': torch.from_numpy(agents_id_remaining),
             "scenario_id": data['scenario_id'],
         }
         return tensors
