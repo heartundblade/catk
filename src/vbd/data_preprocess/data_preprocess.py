@@ -27,7 +27,6 @@ from tqdm import tqdm
 from waymo_open_dataset.protos import scenario_pb2
 
 from src.vbd.data_preprocess.utils import wrap_angle, wrap_to_pi
-from src.vbd.data_preprocess.utils import get_polylines_from_polygon, preprocess_map
 
 MAX_NUM_OBJECTS = 64
 MAX_POLYLINES = 256
@@ -426,8 +425,9 @@ def process_agents(
     sorted_idx = np.argsort(distance_to_sdc)     
     sorted_original_idx = [valid_indices[idx] for idx in sorted_idx]
     
-    remaining_idx = [idx for idx in sorted_original_idx if idx not in tracks_to_predict_idx]
-    combined_idx = tracks_to_predict_idx + remaining_idx
+    sdc_idx = [sdc_idx]
+    remaining_idx = [idx for idx in sorted_original_idx if idx not in sdc_idx + tracks_to_predict_idx]
+    combined_idx = sdc_idx + tracks_to_predict_idx + remaining_idx
     
     # agents_idx = np.array(combined_idx[:max_num_objects])
     agents_idx = combined_idx[:max_num_objects]
@@ -541,7 +541,7 @@ def process_traffic_lights(
         dynamic_map_states,
         max_num_traffic_lights=20,
         current_index=10,
-        ):
+    ):
     signal_state = {
         0: "LANE_STATE_UNKNOWN",
         #  States for traffic signals with arrows.
@@ -742,12 +742,12 @@ def data_process_scenario(
     traffic_light_data = process_traffic_lights(
         scenario.dynamic_map_states,
         max_num_traffic_lights=20,
-        )
+    )
     
     roadgraph_data = process_roadgraph(
         scenario, 
         traffic_light_data, 
-        agents_data['history'][:, -1, :2],
+        agents_data['history'][:, 0, :2], # sdc position
         max_polylines=max_polylines,
         num_points_polyline=num_points_polyline,
     )
@@ -812,7 +812,7 @@ def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
 
     input_dir = Path(input_dir) / split
     packages = sorted([p.as_posix() for p in input_dir.glob("*")])
-    packages = packages[:50]
+    packages = packages[:5]
 
     func = partial(
         wm2vbd,
