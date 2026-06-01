@@ -1,7 +1,8 @@
 import math
 import torch
 import torch.nn as nn
-from timm.models.layers import Mlp
+
+from src.dp.model.module.timm import Mlp
 
 def modulate(x, shift, scale, only_first=False):
     if only_first:

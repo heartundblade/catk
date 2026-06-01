@@ -1,7 +1,7 @@
 from copy import copy, deepcopy
 import torch
 
-from diffusion_planner.utils.train_utils import openjson
+from src.dp.utils.train_utils import openjson
 
 class StateNormalizer:
     def __init__(self, mean, std):
@@ -10,9 +10,16 @@ class StateNormalizer:
 
     @classmethod
     def from_json(cls, args):
-        data = openjson(args.normalization_file_path)
-        mean = [[data["ego"]["mean"]]] + [[data["neighbor"]["mean"]]] * args.predicted_neighbor_num
-        std = [[data["ego"]["std"]]] + [[data["neighbor"]["std"]]] * args.predicted_neighbor_num
+        if isinstance(args, str):
+            path = args
+        else:
+            path = args.normalization_file_path
+        data = openjson(path)
+        
+        # mean = [[data["ego"]["mean"]]] + [[data["neighbor"]["mean"]]] * args.predicted_neighbor_num
+        # std = [[data["ego"]["std"]]] + [[data["neighbor"]["std"]]] * args.predicted_neighbor_num
+        mean = [[data["agents"]["mean"]]]*(args.predicted_neighbor_num+1)
+        std = [[data["agents"]["std"]]]*(args.predicted_neighbor_num+1)
         return cls(mean, std)
     
     def __call__(self, data):

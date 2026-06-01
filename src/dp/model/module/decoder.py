@@ -1,15 +1,13 @@
 import math
 import torch
 import torch.nn as nn
-from timm.models.layers import Mlp
-from timm.layers import DropPath
 
+from src.dp.model.module.timm import Mlp, DropPath
 from src.dp.model.diffusion_utils.sampling import dpm_sampler
 from src.dp.model.diffusion_utils.sde import SDE, VPSDE_linear
 from src.dp.utils.normalizer import ObservationNormalizer, StateNormalizer
 from src.dp.model.module.mixer import MixerBlock
 from src.dp.model.module.dit import TimestepEmbedder, DiTBlock, FinalLayer
-
 
 class Decoder(nn.Module):
     def __init__(self, config):
@@ -22,7 +20,7 @@ class Decoder(nn.Module):
 
         self.dit = DiT(
             sde=self._sde, 
-            route_encoder = RouteEncoder(config.route_num, config.lane_len, drop_path_rate=config.encoder_drop_path_rate, hidden_dim=config.hidden_dim),
+            # route_encoder = RouteEncoder(config.route_num, config.lane_len, drop_path_rate=config.encoder_drop_path_rate, hidden_dim=config.hidden_dim),
             depth=config.decoder_depth, 
             output_dim= (config.future_len + 1) * 4, # x, y, cos, sin
             hidden_dim=config.hidden_dim, 
@@ -31,8 +29,8 @@ class Decoder(nn.Module):
             model_type=config.diffusion_model_type
         )
         
-        self._state_normalizer: StateNormalizer = config.state_normalizer
-        self._observation_normalizer: ObservationNormalizer = config.observation_normalizer
+        self._state_normalizer: StateNormalizer = StateNormalizer.from_json(config)
+        self._observation_normalizer: ObservationNormalizer = ObservationNormalizer.from_json(config.normalization_file_path)
         
         self._guidance_fn = config.guidance_fn
         
@@ -73,19 +71,22 @@ class Decoder(nn.Module):
 
         """
         # Extract ego & neighbor current states
-        ego_current = inputs['ego_current_state'][:, None, :4]
-        neighbors_current = inputs["neighbor_agents_past"][:, :self._predicted_neighbor_num, -1, :4]
-        neighbor_current_mask = torch.sum(torch.ne(neighbors_current[..., :4], 0), dim=-1) == 0
+        # ego_current = inputs['ego_current_state'][:, None, :4]
+        # neighbors_current = inputs["neighbor_agents_past"][:, :self._predicted_neighbor_num, -1, :4]
+        neighbors_current = inputs["agents_history"][:, 1:, -1, :4]
+        neighbor_current_mask = torch.sum(torch.ne(neighbors_current, 0), dim=-1) == 0
         inputs["neighbor_current_mask"] = neighbor_current_mask
 
-        current_states = torch.cat([ego_current, neighbors_current], dim=1) # [B, P, 4]
+        # current_states = torch.cat([ego_current, neighbors_current], dim=1) # [B, P, 4]
+
+        current_states = inputs['agents_history'][:, :, -1, :4]
 
         B, P, _ = current_states.shape
         assert P == (1 + self._predicted_neighbor_num)
 
         # Extract context encoding
         ego_neighbor_encoding = encoder_outputs['encoding']
-        route_lanes = inputs['route_lanes']
+        # route_lanes = inputs['route_lanes']
 
         if self.training:
             sampled_trajectories = inputs['sampled_trajectories'].reshape(B, P, -1) # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
@@ -96,7 +97,7 @@ class Decoder(nn.Module):
                         sampled_trajectories, 
                         diffusion_time,
                         ego_neighbor_encoding,
-                        route_lanes,
+                        # route_lanes,
                         neighbor_current_mask
                     ).reshape(B, P, -1, 4)
                 }
@@ -114,8 +115,8 @@ class Decoder(nn.Module):
                         xT,
                         other_model_params={
                             "cross_c": ego_neighbor_encoding, 
-                            "route_lanes": route_lanes,
-                            "neighbor_current_mask": neighbor_current_mask                            
+                            # "route_lanes": route_lanes,
+                            "neighbor_current_mask": neighbor_current_mask
                         },
                         dpm_solver_params={
                             "correcting_xt_fn":initial_state_constraint,
@@ -126,8 +127,8 @@ class Decoder(nn.Module):
                                 "model": self.dit,
                                 "model_condition": {
                                     "cross_c": ego_neighbor_encoding, 
-                                    "route_lanes": route_lanes,
-                                    "neighbor_current_mask": neighbor_current_mask                            
+                                    # "route_lanes": route_lanes,
+                                    "neighbor_current_mask": neighbor_current_mask
                                 },
                                 "inputs": inputs,
                                 "observation_normalizer": self._observation_normalizer,
@@ -143,7 +144,7 @@ class Decoder(nn.Module):
                     "prediction": x0
                 }
 
-        
+
 class RouteEncoder(nn.Module):
     def __init__(self, route_num, lane_len, drop_path_rate=0.3, hidden_dim=192, tokens_mlp_dim=32, channels_mlp_dim=64):
         super().__init__()
@@ -191,12 +192,22 @@ class RouteEncoder(nn.Module):
 
 
 class DiT(nn.Module):
-    def __init__(self, sde: SDE, route_encoder: nn.Module, depth, output_dim, hidden_dim=192, heads=6, dropout=0.1, mlp_ratio=4.0, model_type="x_start"):
+    def __init__(self, 
+                 sde: SDE, 
+                #  route_encoder: nn.Module, 
+                 depth, 
+                 output_dim, 
+                 hidden_dim=192, 
+                 heads=6, 
+                 dropout=0.1, 
+                 mlp_ratio=4.0, 
+                 model_type="x_start"
+        ):
         super().__init__()
         
         assert model_type in ["score", "x_start"], f"Unknown model type: {model_type}"
         self._model_type = model_type
-        self.route_encoder = route_encoder
+        # self.route_encoder = route_encoder
         self.agent_embedding = nn.Embedding(2, hidden_dim)
         self.preproj = Mlp(in_features=output_dim, hidden_features=512, out_features=hidden_dim, act_layer=nn.GELU, drop=0.)
         self.t_embedder = TimestepEmbedder(hidden_dim)
@@ -204,12 +215,18 @@ class DiT(nn.Module):
         self.final_layer = FinalLayer(hidden_dim, output_dim)
         self._sde = sde
         self.marginal_prob_std = self._sde.marginal_prob_std
-               
+    
     @property
     def model_type(self):
         return self._model_type
 
-    def forward(self, x, t, cross_c, route_lanes, neighbor_current_mask):
+    def forward(self, 
+                x, 
+                t, 
+                cross_c, 
+                # route_lanes, 
+                neighbor_current_mask
+        ):
         """
         Forward pass of DiT.
         x: (B, P, output_dim)   -> Embedded out of DiT
@@ -224,9 +241,10 @@ class DiT(nn.Module):
         x_embedding = x_embedding[None, :, :].expand(B, -1, -1) # (B, P, D)
         x = x + x_embedding     
 
-        route_encoding = self.route_encoder(route_lanes)
-        y = route_encoding
-        y = y + self.t_embedder(t)      
+        # route_encoding = self.route_encoder(route_lanes)
+        # y = route_encoding
+        # y = y + self.t_embedder(t)
+        y = self.t_embedder(t)
 
         attn_mask = torch.zeros((B, P), dtype=torch.bool, device=x.device)
         attn_mask[:, 1:] = neighbor_current_mask

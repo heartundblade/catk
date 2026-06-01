@@ -23,7 +23,7 @@ class DPDataset(Dataset):
         Data class for transforming smart data to vbd input format.
         
         Args:
-            vbd_data_dir: VBD processed data directory
+            dp_data_dir: DP processed data directory
         """
         self.dp_data_dir = dp_data_dir
         self.file_list = glob.glob(dp_data_dir+'/*') if dp_data_dir is not None else []
@@ -40,14 +40,14 @@ class DPDataset(Dataset):
         with open(self.file_list[idx], 'rb') as f:
             data = pickle.load(f)
         data = self.convert_to_tensor(data)
-        if self._tfrecord_dir is not None:
-            data["tfrecord_path"] = (
-                self._tfrecord_dir / (data["scenario_id"] + ".tfrecords")
-            ).as_posix()
-        if self._gt_scenario_dir is not None:
-            gt_path = self._gt_scenario_dir / f"{data['scenario_id']}.pkl"
-            with open(gt_path, "rb") as handle:
-                data["gt_scenario"] = SimpleNamespace(value=pickle.load(handle))
+        # if self._tfrecord_dir is not None:
+        #     data["tfrecord_path"] = (
+        #         self._tfrecord_dir / (data["scenario_id"] + ".tfrecords")
+        #     ).as_posix()
+        # if self._gt_scenario_dir is not None:
+        #     gt_path = self._gt_scenario_dir / f"{data['scenario_id']}.pkl"
+        #     with open(gt_path, "rb") as handle:
+        #         data["gt_scenario"] = SimpleNamespace(value=pickle.load(handle))
         return data
 
     def convert_to_tensor(self, data):
@@ -60,29 +60,41 @@ class DPDataset(Dataset):
         Returns:
             torch tensor dictionary.
         """
+        sdc_coord = data['sdc_coord']
         agents_history = data['agents_history']
         agents_interested = data['agents_interested']
         agents_future = data['agents_future']
         agents_future_valid = data['agents_future_valid']
         agents_type = data['agents_type']
         traffic_light_points = data['traffic_light_points']
-        polylines = data['polylines']
-        polylines_valid = data['polylines_valid']
-        relations = data['relations']
+        lanes = data['lanes']
+        lanes_valid = data['lanes_valid']
+        lanes_speed_limit = data['lanes_speed_limit']
+        lanes_has_speed_limit = data['lanes_has_speed_limit']
+        roadlines = data['roadlines']
+        roadlines_valid = data['roadlines_valid']
+        static_maps = data['static_maps']
+        static_maps_valid = data['static_maps_valid']
         agents_id = data['agents_id']
         agents_history_remaining = data['agents_history_remaining']
         agents_id_remaining = data['agents_id_remaining']
 
         tensors = {
+            "sdc_coord": torch.from_numpy(sdc_coord),
             "agents_history": torch.from_numpy(agents_history),
             "agents_interested": torch.from_numpy(agents_interested),
             "agents_future": torch.from_numpy(agents_future),
             "agents_future_valid": torch.from_numpy(agents_future_valid),
             "agents_type": torch.from_numpy(agents_type),
             "traffic_light_points": torch.from_numpy(traffic_light_points),
-            "polylines": torch.from_numpy(polylines),
-            "polylines_valid": torch.from_numpy(polylines_valid),
-            "relations": torch.from_numpy(relations),
+            "lanes": torch.from_numpy(lanes),
+            "lanes_valid": torch.from_numpy(lanes_valid),
+            "lanes_speed_limit": torch.from_numpy(lanes_speed_limit),
+            "lanes_has_speed_limit": torch.from_numpy(lanes_has_speed_limit),
+            "roadlines": torch.from_numpy(roadlines),
+            "roadlines_valid": torch.from_numpy(roadlines_valid),
+            "static_maps": torch.from_numpy(static_maps),
+            "static_maps_valid": torch.from_numpy(static_maps_valid),
             'agents_id': torch.from_numpy(agents_id),
             'agents_history_remaining': torch.from_numpy(agents_history_remaining),
             'agents_id_remaining': torch.from_numpy(agents_id_remaining),

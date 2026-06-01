@@ -2,8 +2,8 @@ _target_: lightning.pytorch.trainer.Trainer
 
 default_root_dir: ${paths.output_dir}
 
-limit_train_batches: 5
-limit_val_batches: 5
+limit_train_batches: 1.0
+limit_val_batches: 1.0
 limit_test_batches: 1.0
 
 # max_steps: 25000

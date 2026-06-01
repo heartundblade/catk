@@ -310,44 +310,58 @@ def batch_transform_trajs_to_local_frame(trajs, ref_idx=-1):
 
     return trajs
 
-def transform_polylines_to_sdc_frame(polylines, sdc_states):
+def transform_coords_to_sdc_frame(coords, sdc_states):
     """
-    Batch transform polylines to the SDC frame of reference.
+    Batch transform coordinates to the SDC frame of reference.
 
     Args:
-        polylines (np.ndarray): Polylines array of shape [N, x, 2]. [x, y]
+        coords (np.ndarray): Coordinates array of shape [N, x, 4/6]. [x, y, cos(heading), sin(heading), (vx, vy)]
         sdc_states (np.ndarray): SDC states array of shape [3]. [x, y, theta]
 
     Returns:
-        np.ndarray: Transformed polylines in the SDC frame. [N, x, 2]
+        np.ndarray: Transformed coordinates in the SDC frame. [N, x, 4/6]
 
     """
-    x_sdc, y_sdc, theta_sdc = sdc_states
+    # Create a mask for valid coordinates (not all zeros in last dimension)
+    valid_mask = np.any(coords != 0, axis=-1)
     
-    # First translate to SDC origin, then rotate
-    g_x = polylines[..., 0] - x_sdc
-    g_y = polylines[..., 1] - y_sdc
+    # Initialize transformed array with original values (preserves zero-padding)
+    transformed = coords.copy()
     
-    cos_theta = np.cos(theta_sdc)
-    sin_theta = np.sin(theta_sdc)
+    if not np.any(valid_mask):
+        # All coordinates are zero, no transformation needed
+        return transformed
     
-    x = g_x * cos_theta + g_y * sin_theta
-    y = -g_x * sin_theta + g_y * cos_theta
+    cos_theta = np.cos(sdc_states[2])
+    sin_theta = np.sin(sdc_states[2])
     
-    # # Convert sin(heading), cos(heading) to theta
-    # sin_heading = polylines[..., 2]
-    # cos_heading = polylines[..., 3]
-    # theta = np.arctan2(sin_heading, cos_heading)
+    # Create rotation matrix
+    rotation_matrix = np.array([
+        [cos_theta, sin_theta],
+        [-sin_theta, cos_theta]
+    ])
     
-    # # Transform heading to SDC frame
-    # theta_sdc_frame = theta - theta_sdc
-    # theta_sdc_frame = wrap_angle_np(theta_sdc_frame)
+    def rotate_vectors(vectors):
+        """Rotate 2D vectors using rotation matrix with proper broadcasting."""
+        return np.matmul(vectors, rotation_matrix.T)
     
-    # # Convert back to sin, cos
-    # sin_heading_sdc = np.sin(theta_sdc_frame)
-    # cos_heading_sdc = np.cos(theta_sdc_frame)
+    # Translate to SDC origin
+    translated = coords[..., :2] - sdc_states[:2]
     
-    # transformed = np.stack([x, y, sin_heading_sdc, cos_heading_sdc], axis=-1)
+    # Rotate position, heading, and velocity (if present)
+    rotated = rotate_vectors(translated)
+    heading_rotated = rotate_vectors(coords[..., 2:4])
     
-    transformed = np.stack([x, y], axis=-1)
+    if coords.shape[-1] == 4:
+        transformed[valid_mask, 0:2] = rotated[valid_mask]
+        transformed[valid_mask, 2:4] = heading_rotated[valid_mask]
+    elif coords.shape[-1] == 6:
+        vel_rotated = rotate_vectors(coords[..., 4:6])
+        
+        transformed[valid_mask, 0:2] = rotated[valid_mask]
+        transformed[valid_mask, 2:4] = heading_rotated[valid_mask]
+        transformed[valid_mask, 4:6] = vel_rotated[valid_mask]
+    else:
+        raise ValueError(f"Invalid coordinate shape: {coords.shape}")
+    
     return transformed

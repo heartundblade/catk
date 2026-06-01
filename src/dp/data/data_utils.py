@@ -36,6 +36,6 @@ def data_collate_fn(batch_list):
         if key in special_keys:
             input_batch[key] = value
         else:
-            input_batch[key] = torch.from_numpy(np.stack(value, axis=0))
+            input_batch[key] = torch.stack(value, axis=0)
     
     return input_batch

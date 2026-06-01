@@ -1,6 +1,6 @@
-_target_: src.vbd.datamodule.VBDDataModule
-train_batch_size: 4
-val_batch_size: 4
+_target_: src.dp.datamodule.DPDataModule
+train_batch_size: 50
+val_batch_size: 50
 test_batch_size: 4
 num_workers: 4
 shuffle: true

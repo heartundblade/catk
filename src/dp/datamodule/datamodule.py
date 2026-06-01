@@ -1,0 +1,99 @@
+# src/dp/datamodule/datamodule.py
+from typing import Optional
+
+from lightning import LightningDataModule
+from lightning.pytorch.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADERS
+from torch.utils.data import DataLoader
+
+from src.dp.data.dataset import DPDataset
+
+
+class DPDataModule(LightningDataModule):
+    def __init__(
+        self,
+        train_batch_size: int,
+        val_batch_size: int,
+        test_batch_size: int,
+        train_raw_dir: str,
+        val_raw_dir: str,
+        test_raw_dir: str,
+        val_tfrecords_splitted: str,
+        val_gt_scenario_dir: str,
+        shuffle: bool,
+        num_workers: int,
+        pin_memory: bool,
+        persistent_workers: bool,
+    ) -> None:
+        super(DPDataModule, self).__init__()
+        self.train_batch_size = train_batch_size
+        self.val_batch_size = val_batch_size
+        self.test_batch_size = test_batch_size
+        self.shuffle = shuffle
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
+        self.persistent_workers = persistent_workers and num_workers > 0
+        self.train_raw_dir = train_raw_dir
+        self.val_raw_dir = val_raw_dir
+        self.test_raw_dir = test_raw_dir
+
+        self.val_tfrecords_splitted = val_tfrecords_splitted
+        self.val_gt_scenario_dir = val_gt_scenario_dir
+
+    def setup(self, stage: Optional[str] = None) -> None:
+        if stage == "fit" or stage is None:
+            self.train_dataset = DPDataset(
+                dp_data_dir=self.train_raw_dir,
+            )
+            self.val_dataset = DPDataset(
+                dp_data_dir=self.val_raw_dir,
+                val_tfrecords_splitted=self.val_tfrecords_splitted,
+                val_gt_scenario_dir=self.val_gt_scenario_dir,
+            )
+        elif stage == "validate":
+            self.val_dataset = DPDataset(
+                dp_data_dir=self.val_raw_dir,
+                val_tfrecords_splitted=self.val_tfrecords_splitted,
+                val_gt_scenario_dir=self.val_gt_scenario_dir,
+            )
+        elif stage == "test":
+            self.test_dataset = DPDataset(
+                dp_data_dir=self.test_raw_dir,
+            )
+        else:
+            raise ValueError(f"{stage} should be one of [fit, validate, test]")
+
+    def train_dataloader(self) -> TRAIN_DATALOADERS:
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.train_batch_size,
+            shuffle=self.shuffle,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers,
+            drop_last=False,
+            collate_fn=self.train_dataset.__collate_fn__,
+        )
+
+    def val_dataloader(self) -> EVAL_DATALOADERS:
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.val_batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers,
+            drop_last=False,
+            collate_fn=self.val_dataset.__collate_fn__,
+        )
+
+    def test_dataloader(self) -> EVAL_DATALOADERS:
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.test_batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.persistent_workers,
+            drop_last=False,
+            collate_fn=self.test_dataset.__collate_fn__,
+        )

@@ -1,5 +1,6 @@
 import torch.nn as nn
-from timm.models.layers import Mlp
+
+from src.dp.model.module.timm import Mlp
 
 class MixerBlock(nn.Module):
     def __init__(self, tokens_mlp_dim, channels_mlp_dim, drop_path_rate):
