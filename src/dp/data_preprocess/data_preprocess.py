@@ -545,7 +545,7 @@ def process_agents(
     sdc_idx = scenario.sdc_track_index
 
     tracks_to_predict = scenario.tracks_to_predict
-    tracks_to_predict_idx = [t.track_index for t in tracks_to_predict]
+    tracks_to_predict_idx = [t.track_index for t in tracks_to_predict if t.track_index != sdc_idx]
 
     # select agents based on distance to sdc
     sdc_coord = np.array(

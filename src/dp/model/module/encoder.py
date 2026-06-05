@@ -276,17 +276,28 @@ class LaneFusionEncoder(nn.Module):
         # Apply embedding directly to valid speed limit data
         has_speed_limit = has_speed_limit[valid_indices].squeeze(-1)
         speed_limit = speed_limit[valid_indices].squeeze(-1)
-        speed_limit_embedding = torch.zeros((speed_limit.shape[0], self._channel), device=x.device)
+        # speed_limit_embedding = torch.zeros((speed_limit.shape[0], self._channel), device=x.device)
 
-        if has_speed_limit.sum() > 0:
-            speed_limit_with_limit = self.speed_limit_emb(speed_limit[has_speed_limit].unsqueeze(-1))
-            speed_limit_embedding[has_speed_limit] = speed_limit_with_limit
+        # if has_speed_limit.sum() > 0:
+        #     speed_limit_with_limit = self.speed_limit_emb(speed_limit[has_speed_limit].unsqueeze(-1))
+        #     speed_limit_embedding[has_speed_limit] = speed_limit_with_limit
 
-        if (~has_speed_limit).sum() > 0:
-            speed_limit_no_limit = self.unknown_speed_emb.weight.expand(
-                (~has_speed_limit).sum().item(), -1
-            )
-            speed_limit_embedding[~has_speed_limit] = speed_limit_no_limit
+        # if (~has_speed_limit).sum() > 0:
+        #     speed_limit_no_limit = self.unknown_speed_emb.weight.expand(
+        #         (~has_speed_limit).sum().item(), -1
+        #     )
+        #     speed_limit_embedding[~has_speed_limit] = speed_limit_no_limit
+        
+        unknown_indices = torch.zeros(speed_limit.shape[0], dtype=torch.long, device=x.device)
+        unknown_emb_all = self.unknown_speed_emb(unknown_indices)  # [B*P, C]
+
+        speed_limit_emb_all = self.speed_limit_emb(speed_limit.unsqueeze(-1))  # [V, C]
+
+        speed_limit_embedding = torch.where(
+            has_speed_limit.unsqueeze(-1).bool(),   # [V, 1] -> broadcast to [V, C]
+            speed_limit_emb_all,
+            unknown_emb_all
+        )
 
         # Process traffic lights directly for valid positions
         traffic = traffic[valid_indices]

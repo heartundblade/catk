@@ -40,14 +40,14 @@ class DPDataset(Dataset):
         with open(self.file_list[idx], 'rb') as f:
             data = pickle.load(f)
         data = self.convert_to_tensor(data)
-        # if self._tfrecord_dir is not None:
-        #     data["tfrecord_path"] = (
-        #         self._tfrecord_dir / (data["scenario_id"] + ".tfrecords")
-        #     ).as_posix()
-        # if self._gt_scenario_dir is not None:
-        #     gt_path = self._gt_scenario_dir / f"{data['scenario_id']}.pkl"
-        #     with open(gt_path, "rb") as handle:
-        #         data["gt_scenario"] = SimpleNamespace(value=pickle.load(handle))
+        if self._tfrecord_dir is not None:
+            data["tfrecord_path"] = (
+                self._tfrecord_dir / (data["scenario_id"] + ".tfrecords")
+            ).as_posix()
+        if self._gt_scenario_dir is not None:
+            gt_path = self._gt_scenario_dir / f"{data['scenario_id']}.pkl"
+            with open(gt_path, "rb") as handle:
+                data["gt_scenario"] = SimpleNamespace(value=pickle.load(handle))
         return data
 
     def convert_to_tensor(self, data):

@@ -1,7 +1,7 @@
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, MultiplicativeLR
 
-def CosineAnnealingWarmUpRestarts(optimizer, epoch, warm_up_epoch, start_factor=0.1):
-    assert epoch >= warm_up_epoch
+def CosineAnnealingWarmUpRestarts(optimizer, epochs, warm_up_epoch, start_factor=0.1):
+    assert epochs >= warm_up_epoch
     T_warmup = warm_up_epoch
     
     warmup_scheduler = LinearLR(optimizer, start_factor=start_factor, total_iters=warm_up_epoch - 1)

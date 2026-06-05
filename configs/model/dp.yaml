@@ -60,3 +60,19 @@ config:
 
   # Guidance Function
   guidance_fn: null
+
+  # Validation Parameters
+  step_len: 10
+  val_open_loop: true
+  val_closed_loop: false
+  fast_wosac_metric: false
+  n_rollout_closed_val: 1
+  log_epoch: -1
+  wosac_submission: 
+    is_active: false
+    method_name: "DP"
+    authors: [Anonymous]
+    affiliation: YOUR_AFFILIATION
+    description: YOUR_DESCRIPTION
+    method_link: YOUR_METHOD_LINK
+    account_name: YOUR_ACCOUNT_NAME
