@@ -4,14 +4,22 @@ from typing import Any, Callable, Dict, List, Tuple
 
 import torch
 import torch.nn as nn
+from torch.nn.functional import smooth_l1_loss, cross_entropy
 
 import lightning.pytorch as pl
+from lightning.pytorch.utilities import grad_norm
 
 from src.dp.model.module.encoder import Encoder
 from src.dp.model.module.decoder import Decoder
-from src.dp.utils.normalizer import StateNormalizer, ObservationNormalizer
+from src.dp.model.module.goal_predictor import GoalPredictor
+from src.dp.utils.normalizer import StateNormalizer, ObservationNormalizer, ActionNormalizer
 from src.dp.utils.lr_schedule import CosineAnnealingWarmUpRestarts
-from src.dp.utils.train_utils import transform_coords_to_sdc_frame, transform_coords_to_global_frame
+from src.dp.utils.train_utils import (
+    transform_coords_to_sdc_frame, 
+    transform_coords_to_global_frame, 
+    inverse_kinematics, 
+    roll_out
+)
 from src.smart.metrics import (
     WOSACMetric,
     WOSACMetrics,
@@ -27,9 +35,15 @@ class Diffusion_Planner(pl.LightningModule):
 
         self.state_normalizer = StateNormalizer.from_json(self.cfg)
         self.observation_normalizer = ObservationNormalizer.from_json(self.cfg.normalization_file_path)
+        self.action_normalizer = ActionNormalizer.from_json(self.cfg)
 
         self.encoder = Diffusion_Planner_Encoder(self.cfg)
         self.decoder = Diffusion_Planner_Decoder(self.cfg)
+        
+        # Goal predictor
+        self._train_predictor = config.get('train_predictor', True)
+        self.predictor = GoalPredictor(self.cfg.predictor) if self._train_predictor else None
+        self._predicted_neighbor_num = config.get('predicted_neighbor_num', 31)
         
         # Validation settings
         self._future_len = config.get('future_len', 80)
@@ -38,6 +52,9 @@ class Diffusion_Planner(pl.LightningModule):
         self._val_closed_loop = config.get('val_closed_loop', False)
         self._n_rollout_closed_val = config.get('n_rollout_closed_val', 32)
         self.log_epoch = config.get('log_epoch', -1)
+
+        self._action_len = config.get('action_len', 2)
+        self._num_actions = self._future_len // self._action_len
         
         # WOSAC metrics
         if config.get('fast_wosac_metric', False):
@@ -60,7 +77,7 @@ class Diffusion_Planner(pl.LightningModule):
         return encoder_outputs, decoder_outputs
     
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.cfg.learning_rate)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.cfg.learning_rate)
         scheduler = CosineAnnealingWarmUpRestarts(optimizer, self.cfg.train_epochs, self.cfg.warm_up_epoch)
         # return [optimizer], [scheduler]
         return {
@@ -86,8 +103,6 @@ class Diffusion_Planner(pl.LightningModule):
         inputs["roadlines"][..., :4] = transform_coords_to_sdc_frame(inputs["roadlines"][..., :4], inputs['sdc_coord'])
         inputs["static_maps"][..., :4] = transform_coords_to_sdc_frame(inputs["static_maps"][..., :4], inputs['sdc_coord'])
 
-        inputs = self.observation_normalizer(inputs)
-
         # inputs['agents_future'][..., :4] = self.state_normalizer(inputs['agents_future'][..., :4])
         # self._log_output(
         #     None, 
@@ -97,23 +112,26 @@ class Diffusion_Planner(pl.LightningModule):
         #     sdc_coord=batch['sdc_coord'],
         # )
 
-        loss = {}
-        dpm_loss, loss, _ = self.diffusion_loss_func(
+        loss_dict = {}
+        loss, loss_dict, _ = self.diffusion_loss_func(
             inputs=inputs,
             marginal_prob=self.sde.marginal_prob,
             # futures=batch["agents_future"],
-            norm=self.state_normalizer,
-            loss=loss,
+            norm=self.action_normalizer,
+            loss_dict=loss_dict,
             model_type="x_start",
         )
 
-        # Log training losses for monitoring
-        self.log("train/dpm_loss", dpm_loss, prog_bar=True)
-        self.log("train/ego_planning_loss", loss["ego_planning_loss"], prog_bar=True)
-        self.log("train/neighbor_prediction_loss", loss["neighbor_prediction_loss"])
-        self.log("train/total_loss", loss["ego_planning_loss"] + loss["neighbor_prediction_loss"])
+        # Log each loss component separately
+        for key, value in loss_dict.items():
+            self.log(
+                key, 
+                value,
+                on_step=True, on_epoch=False, sync_dist=True,
+                prog_bar=True
+            )
         
-        return dpm_loss
+        return loss
     
     def validation_step(self, batch, batch_idx):
         """
@@ -123,7 +141,7 @@ class Diffusion_Planner(pl.LightningModule):
             batch: Input batch.
             batch_idx: Batch index.
         """
-        # Open-loop validation
+        loss_dict = {}
         if self._val_open_loop:
             inputs = {}
             for key, value in batch.items():
@@ -138,33 +156,29 @@ class Diffusion_Planner(pl.LightningModule):
             inputs["roadlines"][..., :4] = transform_coords_to_sdc_frame(inputs["roadlines"][..., :4], inputs['sdc_coord'])
             inputs["static_maps"][..., :4] = transform_coords_to_sdc_frame(inputs["static_maps"][..., :4], inputs['sdc_coord'])
             
-            inputs = self.observation_normalizer(inputs)
-
-            loss = {}
-            dpm_loss, loss, decoder_output = self.diffusion_loss_func(
+            loss, loss_dict, decoder_output = self.diffusion_loss_func(
                 inputs=inputs,
                 marginal_prob=self.sde.marginal_prob,
-                norm=self.state_normalizer,
-                loss=loss,
+                norm=self.action_normalizer,
+                loss_dict=loss_dict,
                 model_type="x_start",
             )
             
-            # Log validation losses for monitoring
-            self.log("val/dpm_loss", dpm_loss, prog_bar=True, batch_size=inputs["agents_history"].shape[0])
-            self.log("val/ego_planning_loss", loss["ego_planning_loss"], prog_bar=True)
-            self.log("val/neighbor_prediction_loss", loss["neighbor_prediction_loss"])
-            self.log("val/total_loss", loss["ego_planning_loss"] + loss["neighbor_prediction_loss"])
+            self.log_dict(
+                loss_dict, 
+                on_step=True, on_epoch=False, sync_dist=True,
+                prog_bar=True
+            )
 
             # Record decoder output and map elements
-            # self._log_output(
-            #     decoder_output['prediction'], 
-            #     batch, 
-            #     batch_idx,
-            #     trans2global=True,
-            #     sdc_coord=batch['sdc_coord'],
-            # )
+            self._log_output(
+                decoder_output['predicted_trajectories'], 
+                batch, 
+                batch_idx,
+                trans2global=True,
+                sdc_coord=batch['sdc_coord'],
+            )
 
-        # Closed-loop validation
         if self._val_closed_loop:
             step_len = self._step_len
             future_len = self._future_len
@@ -187,99 +201,84 @@ class Diffusion_Planner(pl.LightningModule):
             pred_traj = []
             for r in range(self._n_rollout_closed_val):
                 print('closed-loop rollout', r)
-                traj = []
+                trajs = []
                 inputs_ = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
                 
                 # Track SDC position for each step (in global frame)
                 sdc_coord_global = batch['sdc_coord'].clone()  # [B, 3]
+                prev_pred_global = batch['agents_history'][..., :self._predicted_neighbor_num+1, :, :6].clone()  # [B, P, T_hist, 6] in global frame
                 
                 for t in range((future_len + step_len - 1) // step_len):
-                    # Convert all map elements to current SDC frame
-                    # For t=0, inputs_ is already in initial SDC frame
-                    # For t>0, inputs_ needs to be converted from previous SDC frame to current SDC frame
-                    if t > 0:
-                        # Convert to current SDC frame
-                        inputs_['agents_history'][..., :6] = transform_coords_to_sdc_frame(
-                            inputs_['agents_history'][..., :6],
-                            prev_sdc_coord
+                    # Convert inputs to SDC frame for model input
+                    if t == 0:
+                        # First step: inputs are already in initial SDC frame
+                        inputs_sdc = inputs_
+                        current_states_global = batch['agents_history'][..., :self._predicted_neighbor_num+1, -1, :6].clone()  # [B, P, 6]
+                    else:
+                        # Convert all map elements to current SDC frame from global
+                        inputs_sdc = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in inputs_.items()}
+                        inputs_sdc['agents_history'][..., :self._predicted_neighbor_num+1, :, :6] = transform_coords_to_sdc_frame(
+                            prev_pred_global,
+                            sdc_coord_global
                         )
-                        inputs_['lanes'][..., :4] = transform_coords_to_sdc_frame(
-                            inputs_['lanes'][..., :4],
-                            prev_sdc_coord
+                        inputs_sdc['lanes'][..., :4] = transform_coords_to_sdc_frame(
+                            batch['lanes'][..., :4],
+                            sdc_coord_global
                         )
-                        inputs_['roadlines'][..., :4] = transform_coords_to_sdc_frame(
-                            inputs_['roadlines'][..., :4],
-                            prev_sdc_coord
+                        inputs_sdc['roadlines'][..., :4] = transform_coords_to_sdc_frame(
+                            batch['roadlines'][..., :4],
+                            sdc_coord_global
                         )
-                        inputs_['static_maps'][..., :4] = transform_coords_to_sdc_frame(
-                            inputs_['static_maps'][..., :4],
-                            prev_sdc_coord
+                        inputs_sdc['static_maps'][..., :4] = transform_coords_to_sdc_frame(
+                            batch['static_maps'][..., :4],
+                            sdc_coord_global
                         )
-
-                        inputs_['agents_future'][..., :6] = transform_coords_to_sdc_frame(
-                            inputs_['agents_future'][..., :6],
-                            prev_sdc_coord
+                        inputs_sdc['agents_future'][..., :6] = transform_coords_to_sdc_frame(
+                            batch['agents_future'][..., :6],
+                            sdc_coord_global
                         )
+                        current_states_global = prev_pred_global[:, :self._predicted_neighbor_num+1, -1, :6].clone()  # [B, P, 6]
                     
-                    # prev_sdc_coord = sdc_coord_global.clone()
-                    inputs_normalized = self.observation_normalizer(inputs_)
-                    
-                    # Get prediction from decoder (in SDC frame)
-                    _, decoder_output = self.forward(inputs_normalized)
-                    pred = decoder_output["prediction"]  # [B, P, T, 4]
-                    
-                    # if t==0:
+                    # if t == 4:
                     #     self._log_output(
-                    #         # inputs_["agents_history"][..., :6],
-                    #         pred,
-                    #         inputs_,
-                    #         # batch,
+                    #         decoder_output['predicted_trajectories'], 
+                    #         # inputs_sdc['agents_history'],
+                    #         batch, 
+                    #         # inputs_sdc,
                     #         batch_idx,
-                    #         log_dir='/home/zhanghailiang/Repos/catk/logs/debug',
                     #         trans2global=False,
-                    #         sdc_coord=None
+                    #         sdc_coord=batch['sdc_coord'],
                     #     )
+
+                    # inputs_normalized = self.observation_normalizer(inputs_sdc)
+                    # inputs_normalized = inputs_sdc
+
+                    _, decoder_output = self.forward(inputs_sdc)
+                    pred_actions = decoder_output["prediction"]  # [B, P, num_actions, 2]
                     
-                    pred_trajs_step_sdc = pred[:, :, :step_len, :]  # [B, P, step_len, 4]
+                    pred_actions = self.action_normalizer.inverse(pred_actions)
+                    pred_trajs_global = roll_out(
+                        current_states_global,  # [B, P, 6]
+                        pred_actions,
+                        dt=0.1,
+                        action_len=self._action_len,
+                        global_frame=True
+                    )  # [B, P, T, 6] - x, y, cos(theta), sin(theta), v_x, v_y
                     
-                    # Convert prediction to global frame for storage and SDC update
-                    # prev_coord_pt = pred_trajs_step_sdc[:, 0, -1, :].clone()
-                    prev_coord_pt = pred_trajs_step_sdc[:, 0, -1, :].clone()  # [B, 4]
-                    prev_sdc_coord = torch.zeros_like(prev_coord_pt[:, :3])  # [B, 3]
-                    prev_sdc_coord[:, :2] = prev_coord_pt[:, :2]  # x, y
-                    prev_sdc_coord[:, 2] = torch.atan2(prev_coord_pt[:, 3], prev_coord_pt[:, 2])
-                    pred_trajs_step_global = transform_coords_to_global_frame(
-                        pred_trajs_step_sdc,
-                        sdc_coord_global
-                    )  # [B, P, step_len, 4]
+                    pred_trajs_step_global = pred_trajs_global[:, :, :step_len, :]  # [B, P, step_len, 6]
+                    trajs.append(pred_trajs_step_global[..., :4])
                     
-                    traj.append(pred_trajs_step_global)
-                    
-                    # Update SDC position based on ego vehicle's prediction
-                    # Assuming ego is the first agent (index 0)
-                    ego_pred_global = pred_trajs_step_global[:, 0, self._step_len-1, :]  # [B, 4]
+                    ego_pred_global = pred_trajs_step_global[:, 0, step_len-1, :]  # [B, 6]
                     sdc_coord_global[:, 0] = ego_pred_global[:, 0]  # x
                     sdc_coord_global[:, 1] = ego_pred_global[:, 1]  # y
-                    sdc_coord_global[:, 2] = torch.atan2(ego_pred_global[:, 3], ego_pred_global[:, 2])
+                    sdc_coord_global[:, 2] = torch.atan2(ego_pred_global[:, 3], ego_pred_global[:, 2])  # theta from cos/sin
                     
-                    # Update inputs_ for next step (closed-loop)
-                    # Shift history and append predicted traj (in SDC frame)
-                    current_states = inputs_['agents_history'][:, :, -1:, :6]  # [B, P, 1, 6] - include vx, vy
+                    # Update history in global frame for next step
+                    # pred_trajs_step_global: [B, P, step_len, 6] -> [x, y, cos(theta), sin(theta), v_x, v_y]
+                    prev_pred_global = torch.cat([prev_pred_global[:, :, -1:, :], pred_trajs_step_global], dim=2)  # [B, P, T_hist + T_pred, 6]
                     
-                    # Compute velocity from position differences
-                    # pred_trajs_step_sdc: [B, P, step_len, 4] -> [x, y, cos_heading, sin_heading]
-                    # velocity = (pos[t] - pos[t-1]) / dt
-                    dt = 0.1  # assuming 10Hz
-                    pos_history = torch.cat([current_states[:, :, :, :2], pred_trajs_step_sdc[:, :, :, :2]], dim=2)  # [B, P, step_len+1, 2]
-                    vel = (pos_history[:, :, 1:, :] - pos_history[:, :, :-1, :]) / dt  # [B, P, step_len, 2]
-                    pred_with_vel = torch.cat([pred_trajs_step_sdc, vel], dim=-1)  # [B, P, step_len, 6]
-                    new_history = torch.cat([current_states, pred_with_vel], dim=2)  # [B, P, step_len+1, 6]
-                    
-                    inputs_['agents_history'][:, :, :, :6] = new_history
-                    # Note: new_history is already in current SDC frame, no need to transform again
-                
-                full_traj = torch.cat(traj, dim=-2)  # [B, P, future_len, 4] - in global frame
-                pred_traj.append(full_traj)
+                full_trajs = torch.cat(trajs, dim=-2)  # [B, P, future_len, 4] - in global frame
+                pred_traj.append(full_trajs)
             
             pred_traj = torch.stack(pred_traj, dim=1)  # [B, n_rollout, P, future_len, 4]
             
@@ -292,11 +291,9 @@ class Diffusion_Planner(pl.LightningModule):
                     num_agents_remaining = batch['agents_history_remaining'][i].shape[0]
                     cur_data = batch['agents_history_remaining'][i].clone()  # [A, T, 9]
                     
-                    # Concatenate agent ids
                     if 'agents_id_remaining' in batch:
                         all_agents_id_list[i] = torch.cat([all_agents_id_list[i], batch['agents_id_remaining'][i]], dim=0)
                     
-                    # Linear extrapolation for remaining agents
                     simulated_states_remaining = torch.zeros(
                         (self._n_rollout_closed_val, num_agents_remaining, future_len, 4), 
                         device=self.device
@@ -310,7 +307,6 @@ class Diffusion_Planner(pl.LightningModule):
                     z = states_current[:, 8]  # [A]
                     vel = states_current[:, 4:6]  # [A, 2]
                     
-                    # Linear extrapolation: pos[t] = pos_0 + vel * t
                     time_steps = torch.arange(future_len, device=self.device).float() * 0.1  # [future_len]
                     
                     pos_expanded = pos.unsqueeze(1).unsqueeze(0)  # [1, A, 1, 2]
@@ -319,7 +315,6 @@ class Diffusion_Planner(pl.LightningModule):
                     
                     pred_pos = pos_expanded + vel_expanded * time_expanded  # [1, A, future_len, 2]
                     
-                    # Heading and z remain constant
                     heading_expanded = heading.unsqueeze(0).unsqueeze(-1).expand(
                         self._n_rollout_closed_val, num_agents_remaining, future_len
                     )
@@ -327,25 +322,23 @@ class Diffusion_Planner(pl.LightningModule):
                         self._n_rollout_closed_val, num_agents_remaining, future_len
                     )
                     
-                    # Format: [n_rollout, A, future_len, 4] -> [x, y, z, heading]
                     simulated_states_remaining[..., :2] = pred_pos.expand(
                         self._n_rollout_closed_val, num_agents_remaining, future_len, 2
                     )
                     simulated_states_remaining[..., 2] = z_expanded
                     simulated_states_remaining[..., 3] = heading_expanded
                     
-                    # Concatenate with main predictions
                     simulated_states_list[i] = torch.cat(
                         [simulated_states_list[i], simulated_states_remaining], dim=1
                     )
 
-            # self._log_output(
-            #     [s.cpu().detach().numpy() for s in simulated_states_list], 
-            #     batch, 
-            #     batch_idx, 
-            #     log_dir='/home/zhanghailiang/Repos/catk/logs/debug',
-            #     trans2global=False,
-            # )
+            self._log_output(
+                [s.cpu().detach().numpy() for s in simulated_states_list], 
+                batch, 
+                batch_idx, 
+                log_dir='/home/zhanghailiang/Repos/catk/logs/debug',
+                trans2global=False,
+            )
             
             # Update WOSAC metrics
             if isinstance(self.wosac_metrics, WOSACMetric):
@@ -365,7 +358,7 @@ class Diffusion_Planner(pl.LightningModule):
                 )
                 self.wosac_metrics.update(batch["tfrecord_path"], scenario_rollouts)
         
-        return loss
+        return loss_dict
     
     def on_validation_epoch_end(self):
         if self._val_closed_loop:
@@ -381,6 +374,48 @@ class Diffusion_Planner(pl.LightningModule):
             if self.global_rank == 0:
                 if self.wosac_submission.is_active:
                     self.wosac_submission.save_sub_file()
+
+    def on_after_backward(self):
+        total_norm = 0.0
+        for p in self.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+        
+        # clip_threshold = 1.0   # 应与Trainer中的gradient_clip_val一致
+        # is_clipped = 1.0 if total_norm > clip_threshold else 0.0
+        # total_norm = 0.0
+        # max_grad = 0.0
+        # num_large_grad = 0
+        # total_params = 0
+        
+        # for p in self.parameters():
+        #     if p.grad is not None:
+        #         grad_abs = p.grad.abs()
+        #         max_grad = max(max_grad, grad_abs.max().item())
+        #         total_norm += (p.grad ** 2).sum().item()
+        #         total_params += p.numel()
+        #         # 统计梯度绝对值大于 1.0 的参数个数
+        #         num_large_grad += (grad_abs > 1).sum().item()
+        
+        # global_norm = total_norm ** 0.5
+        # ratio_large = num_large_grad / total_params
+        
+        # print(f"step {self.global_step}: global_norm={global_norm:.2f}, max_grad={max_grad:.4f}, ratio_grad>1={ratio_large:.6f}")
+        
+        # 记录原始范数和裁剪标志（按步记录，epoch结束时自动平均）
+        self.log("grad/global_norm_raw", total_norm, on_step=True, on_epoch=True, prog_bar=False)
+    
+    def on_before_optimizer_step(self, optimizer):
+            norms = grad_norm(self, norm_type=2)
+            global_norm = norms.get("grad_2.0_norm_total", 0.0)
+            
+            clip_threshold = 1.0
+            is_clipped = 1.0 if global_norm >= (clip_threshold - 1e-4) else 0.0
+            
+            self.log("grad/clipping_ratio", is_clipped, on_step=False, on_epoch=True)
+            # self.log("grad/global_norm", global_norm, on_step=False, on_epoch=True)
     
     def diffusion_loss_func(
         self,
@@ -389,80 +424,225 @@ class Diffusion_Planner(pl.LightningModule):
 
         # futures: Tuple[torch.Tensor, torch.Tensor],
         
-        norm: StateNormalizer,
-        loss: Dict[str, Any],
+        norm: ActionNormalizer,
+        loss_dict: Dict[str, Any],
 
         model_type: str,
         eps: float = 1e-3,
     ):
-        agents_future = inputs["agents_future"]  # [B, P, T+1, 9]
-        agents_future_valid = inputs["agents_future_valid"]  # [B, P, T+1]
+        inputs_norm = self.observation_normalizer(inputs)
+        # inputs_norm = inputs
 
+        agents_future = inputs["agents_future"]
+        agents_future_norm = inputs_norm["agents_future"]  # [B, P, T+1, 9]
+        agents_future_valid = inputs_norm["agents_future_valid"]  # [B, P, T+1]
+        agents_interested = inputs_norm["agents_interested"]  # [B, P, T+1]
         B, P, T, _ = agents_future.shape
-        # ego_current, neighbors_current = inputs["ego_current_state"][:, :4], inputs["neighbor_agents_past"][:, :Pn, -1, :4]
-        # neighbor_current_mask = torch.sum(torch.ne(neighbors_current[..., :4], 0), dim=-1) == 0
-        # neighbor_mask = torch.concat((neighbor_current_mask.unsqueeze(-1), neighbor_future_mask), dim=-1)
+        
+        # Get current states [B, P, 1, 6] - need 6 dims: [x, y, cos_yaw, sin_yaw, v_x, v_y]
+        current_states = inputs["agents_history"][:, :, -1:, :6].clone()  # [B, P, 1, 6]
 
-        # gt_future = torch.cat([ego_future[:, None, :, :], neighbors_future[..., :]], dim=1) # [B, P = 1 + 1 + neighbor, T, 4]
-        current_states = inputs["agents_history"][:, :, -1:, :4].clone() # [B, P, 1, 4]
-        gt_future = torch.cat([current_states, norm(agents_future[..., 1:, :4])], dim=2) # [B, P, T+1, 4]
-        gt_future = gt_future * agents_future_valid.unsqueeze(-1)
+        # Get ground truth future states [B, P, T, 3] - x, y, yaw (from cos and sin)
+        gt_future_pos = agents_future[..., 1:, :2].clone()  # [B, P, T, 2] - x, y
+        gt_future_yaw = torch.atan2(agents_future[..., 1:, 3], agents_future[..., 1:, 2])  # [B, P, T]
+        
+        # future_mask = agents_future_valid[..., 1:].clone()  # [B, P, T]
+        future_mask = agents_future_valid[..., 1:]*(agents_interested[..., None]>0)  # [B, P, T]
+
+        gt_actions, gt_actions_valid = inverse_kinematics(
+            agents_future,
+            agents_future_valid,
+            dt=0.1,
+            action_len=self._action_len,
+        )  # gt_actions: [B, P, num_actions, 2], gt_actions_valid: [B, P, num_actions]
 
         if self.training:
             t = torch.rand(B, device=agents_future.device) * (1 - eps) + eps # [B,]
-            z = torch.randn_like(agents_future[..., 1:, :4], device=agents_future.device) # [B, P, T, 4]
+            z = torch.randn_like(gt_actions, device=agents_future.device) # [B, P, num_actions, 2]
             
-            mean, std = marginal_prob(gt_future[:, :, 1:, :], t)
-            std = std.view(-1, *([1] * (len(gt_future[:, :, 1:, :].shape)-1)))
+            gt_actions_norm = norm(gt_actions)
+            
+            mean, std = marginal_prob(gt_actions_norm, t)
+            std = std.view(-1, *([1] * (len(gt_actions_norm.shape)-1)))
 
             xT = mean + std * z
-            xT = torch.cat([gt_future[:, :, :1, :], xT], dim=2)
             
             merged_inputs = {
+                # **inputs_norm,
                 **inputs,
-                "sampled_trajectories": xT,
+                "sampled_actions": xT,
                 "diffusion_time": t,
+                # "current_states": current_states,  # Pass current states for potential use
             }
 
-            _, decoder_output = self.forward(merged_inputs)
-            # Training mode returns "score"
-            pred = decoder_output["score"][:, :, 1:, :]  # [B, P, T, 4]
+            encoder_outputs, decoder_output = self.forward(merged_inputs)
+            pred_actions = decoder_output["score"]  # [B, P, num_actions, 2]
+            pred_actions_norm = decoder_output["score"].clone()
 
-            self._log_output(
-                pred, 
-                inputs, 
-                0,
-                trans2global=False,
-                # sdc_coord=batch['sdc_coord'],
-            )
+            pred_actions = norm.inverse(pred_actions)
+            pred_trajectories = roll_out(
+                current_states.squeeze(2),  # [B, P, 6]
+                pred_actions,
+                dt=0.1,
+                action_len=self._action_len,
+                global_frame=True,
+                training=True
+            )  # [B, P, T, 5]
+            
+            decoder_output["predicted_trajectories"] = pred_trajectories
 
-            # Compute dpm_loss based on model_type
-            if model_type == "score":
-                dpm_loss = torch.sum((pred * std + z)**2, dim=-1)
-            elif model_type == "x_start":
-                dpm_loss = torch.sum((pred - gt_future[:, :, 1:, :])**2, dim=-1)
-        
+            state_loss = smooth_l1_loss(pred_trajectories[..., :2], gt_future_pos, reduction='none').sum(-1)  # [B, P, T]
+            
+            pred_yaw = torch.atan2(pred_trajectories[..., 3], pred_trajectories[..., 2])  # [B, P, T]
+            yaw_error = pred_yaw - gt_future_yaw  # [B, P, T]
+            yaw_error = torch.atan2(torch.sin(yaw_error), torch.cos(yaw_error))
+            yaw_loss = torch.abs(yaw_error)  # [B, P, T]
+            
+            loss = (state_loss*0.2 + yaw_loss) * future_mask
+            
+            loss_dict["train/state_loss"] = (state_loss * future_mask).sum() / future_mask.sum()
+            loss_dict["train/yaw_loss"] = (yaw_loss * future_mask).sum() / future_mask.sum()
+            
+            action_loss = smooth_l1_loss(pred_actions_norm, gt_actions_norm, reduction='none').sum(-1)  # [B, P, num_actions]
+            action_loss = action_loss * gt_actions_valid  # [B, P, num_actions]
+            loss_dict["train/action_loss"] = action_loss.sum() / gt_actions_valid.sum()
+
+            # loss += action_loss.sum() / gt_actions_valid.sum()
         else:
+            # _, decoder_output = self.forward(inputs_norm)
             _, decoder_output = self.forward(inputs)
-            pred = decoder_output["prediction"]  # [B, P, T, 4]
+            pred_actions = decoder_output["prediction"]  # [B, P, num_actions, 2]
+            
+            # Invert actions
+            pred_actions = norm.inverse(pred_actions)
 
-            agents_future = inputs["agents_future"][:, :, 1:, :4]  # [B, P, T, 4]
-            dpm_loss = torch.sum((pred - agents_future)**2, dim=-1)
+            # Roll out actions to get predicted trajectories
+            pred_trajectories = roll_out(
+                current_states[:, :self._predicted_neighbor_num+1, -1, :],  # [B, P, 6]
+                pred_actions,
+                dt=0.1,
+                action_len=self._action_len,
+                global_frame=True,
+                training=False
+            )  # [B, P, T, 5]
+            
+            decoder_output["predicted_trajectories"] = pred_trajectories
+            
+            state_loss = smooth_l1_loss(pred_trajectories[..., :2], gt_future_pos[:, :self._predicted_neighbor_num+1, :, :2], reduction='none').sum(-1)  # [B, P, T]
+            
+            pred_yaw = torch.atan2(pred_trajectories[..., 3], pred_trajectories[..., 2])
+            yaw_error = pred_yaw - gt_future_yaw[:, :self._predicted_neighbor_num+1, :]  # [B, P, T]
+            yaw_error = torch.atan2(torch.sin(yaw_error), torch.cos(yaw_error))
+            yaw_loss = torch.abs(yaw_error)  # [B, P, T]
+
+            loss_dict["val/state_loss"] = (state_loss * future_mask[:, :self._predicted_neighbor_num+1, :]).sum() / future_mask[:, :self._predicted_neighbor_num+1, :].sum()
+            loss_dict["val/yaw_loss"] = (yaw_loss * future_mask[:, :self._predicted_neighbor_num+1, :]).sum() / future_mask[:, :self._predicted_neighbor_num+1, :].sum()
+            
+            action_loss = smooth_l1_loss(pred_actions, gt_actions[:, :self._predicted_neighbor_num+1, :, :], reduction='none').sum(-1)  # [B, P, num_actions]
+            action_loss = action_loss * gt_actions_valid[:, :self._predicted_neighbor_num+1, :]  # [B, P, num_actions]
+            loss_dict["val/action_loss"] = (action_loss[:, :self._predicted_neighbor_num+1, :]).sum() / gt_actions_valid[:, :self._predicted_neighbor_num+1, :].sum()
+            
+            loss = (state_loss + yaw_loss) * future_mask[:, :self._predicted_neighbor_num+1, :]
+            # loss = action_loss.sum() / gt_actions_valid.sum()
         
-        neighbor_future_valid = agents_future_valid.clone()
-        neighbor_future_valid[:, 0, :] = False
-        masked_prediction_loss = dpm_loss[neighbor_future_valid[:, :, 1:]]
+        neighbor_mask = future_mask[:, 1:self._predicted_neighbor_num+1, :]
+        neighbor_loss = loss[:, 1:self._predicted_neighbor_num+1, :]
+        masked_prediction_loss = neighbor_loss[neighbor_mask]
 
-        if masked_prediction_loss.numel() > 0:
-            loss["neighbor_prediction_loss"] = masked_prediction_loss.mean()
+        # if masked_prediction_loss.numel() > 0:
+        #     loss_dict["neighbor_prediction_loss"] = masked_prediction_loss.mean()
+        # else:
+        #     loss_dict["neighbor_prediction_loss"] = torch.tensor(0.0, device=masked_prediction_loss.device)
+
+        # loss_dict["ego_planning_loss"] = loss[:, 0, :][future_mask[:, 0, :]].mean()
+
+        ############### Behavior Prior Prediction #################
+        if self.training and self._train_predictor and self.predictor is not None:
+            # Get anchors from inputs
+            anchors = inputs.get("anchors", None)
+            if anchors is not None:
+                # Forward predictor
+                goal_actions, goal_scores = self.predictor(encoder_outputs, anchors)
+                
+                # Roll out predicted actions to get trajectories
+                goal_trajs = roll_out(
+                    current_states.squeeze(2)[:, :self.predictor._agents_len],  # [B, P, 6]
+                    goal_actions.flatten(2, 3),  # [B, P*Q, num_actions, 2]
+                    dt=0.1,
+                    action_len=self._action_len,
+                    global_frame=True,
+                    training=True
+                )  # [B, P*Q, T, 6]
+                
+                # Reshape back to [B, P, Q, T, 6]
+                goal_trajs = goal_trajs.view(B, self.predictor._agents_len, -1, self._future_len, 6)
+                
+                # Calculate goal loss (similar to VBD)
+                # Get ground truth future
+                gt_future = agents_future[:, :self.predictor._agents_len, 1:, :4]  # [B, P, T, 4]
+                gt_future_valid = agents_future_valid[:, :self.predictor._agents_len, 1:]  # [B, P, T]
+                agents_interest = agents_interested[:, :self.predictor._agents_len]  # [B, P]
+                
+                # Find closest anchor to ground truth end point
+                goal_gt = agents_future[:, :self.predictor._agents_len, -1:, :2]  # [B, P, 1, 2]
+                # anchors_global = transform_coords_to_global_frame(
+                #     anchors[:, :self.predictor._agents_len], 
+                #     inputs['sdc_coord']
+                # )  # [B, P, Q, 2]
+                
+                # Find closest anchor
+                dist_to_goal = torch.norm(anchors[:, :self.predictor._agents_len] - goal_gt, dim=-1)  # [B, P, Q]
+                idx_anchor = torch.argmin(dist_to_goal, dim=-1)  # [B, P]
+                
+                # Find trajectory with min ADE
+                trajs_pred = goal_trajs[..., :4]  # [B, P, Q, T, 4]
+                dist = torch.norm(trajs_pred - gt_future[:, :, None, :, :], dim=-1)  # [B, P, Q, T]
+                dist = dist * gt_future_valid[:, :, None, :]  # [B, P, Q, T]
+                idx_min_ade = torch.argmin(dist.mean(-1), dim=-1)  # [B, P]
+                
+                # Select based on whether end point is valid
+                idx = torch.where(
+                    agents_future_valid[:, :self.predictor._agents_len, -1], 
+                    idx_anchor, 
+                    idx_min_ade
+                )  # [B, P]
+                
+                # Select the best trajectory for each agent
+                batch_idx = torch.arange(B)[:, None].expand(B, self.predictor._agents_len).flatten()
+                agent_idx = torch.arange(self.predictor._agents_len)[None, :].expand(B, self.predictor._agents_len).flatten()
+                selected_trajs = goal_trajs[batch_idx, agent_idx, idx.flatten()]  # [B*P, T, 5]
+                
+                # Calculate trajectory loss
+                traj_loss = smooth_l1_loss(selected_trajs[..., :4], gt_future.flatten(0, 1), reduction='none').sum(-1)  # [B*P, T]
+                traj_mask = gt_future_valid.flatten(0, 1) * (agents_interest.flatten(0, 1) > 0).unsqueeze(-1)  # [B*P, T]
+                traj_loss = traj_loss * traj_mask  # [B*P, T]
+                goal_loss_mean = traj_loss.sum() / traj_mask.sum()
+                
+                # Calculate score loss (cross entropy)
+                scores = goal_scores.flatten(0, 1)  # [B*P, Q]
+                score_loss = cross_entropy(scores, idx.flatten(), reduction='none')  # [B*P]
+                score_loss = score_loss * (agents_interest.flatten(0, 1) > 0)  # [B*P]
+                score_loss_mean = score_loss.sum() / (agents_interest > 0).sum()
+                
+                # Combine losses
+                pred_loss = goal_loss_mean + 0.05 * score_loss_mean
+                
+                # Add to total loss
+                total_loss = loss.sum() / future_mask.sum() + pred_loss
+                
+                loss_dict["val/goal_loss"] = goal_loss_mean.item()
+                loss_dict["val/score_loss"] = score_loss_mean.item()
+                loss_dict["val/pred_loss"] = pred_loss.item()
+            else:
+                total_loss = loss.sum() / future_mask.sum()
         else:
-            loss["neighbor_prediction_loss"] = torch.tensor(0.0, device=masked_prediction_loss.device)
+            total_loss = loss.sum() / future_mask.sum()
+            # total_loss = action_loss.sum() / gt_actions_valid.sum()
 
-        loss["ego_planning_loss"] = dpm_loss[:, 0, :].mean()
+        if self.training:
+            assert not torch.isnan(total_loss).sum(), f"loss cannot be nan"
 
-        assert not torch.isnan(dpm_loss).sum(), f"loss cannot be nan, z={z}"
-
-        return dpm_loss[agents_future_valid[:, :, 1:]].mean(), loss, decoder_output
+        return total_loss, loss_dict, decoder_output
     
     def _log_output(
             self, 
@@ -522,7 +702,6 @@ class Diffusion_Planner(pl.LightningModule):
                 'agents_interested': batch['agents_interested'].cpu().detach().numpy(),
             }
         
-        # Ensure log directory exists
         os.makedirs(log_dir, exist_ok=True)
         
         if batch_idx == 0: 

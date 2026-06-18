@@ -35,6 +35,39 @@ class StateNormalizer:
         }
 
 
+class ActionNormalizer:
+    def __init__(self, mean, std):
+        self.mean = torch.as_tensor(mean)
+        self.std = torch.as_tensor(std)
+
+    @classmethod
+    def from_json(cls, args):
+        if isinstance(args, str):
+            path = args
+        else:
+            path = args.normalization_file_path
+        data = openjson(path)
+        
+        # Read action normalization parameters from "actions" key
+        # mean = data["actions"]["mean"]
+        # std = data["actions"]["std"]
+        mean = [[data["actions"]["mean"]]]*(args.predicted_neighbor_num+1)
+        std = [[data["actions"]["std"]]]*(args.predicted_neighbor_num+1)
+        return cls(mean, std)
+    
+    def __call__(self, data):
+        return (data - self.mean.to(data.device)) / self.std.to(data.device)
+
+    def inverse(self, data):
+        return data * self.std.to(data.device) + self.mean.to(data.device)
+
+    def to_dict(self):
+        return {
+            "mean": self.mean.detach().cpu().numpy().tolist(),
+            "std": self.std.detach().cpu().numpy().tolist()
+        }
+
+
 class ObservationNormalizer:
     def __init__(self, normalization_dict):
         self._normalization_dict = normalization_dict

@@ -5,8 +5,11 @@ defaults:
   - override /model: dp
 
 trainer:
-  max_epochs: 100
   limit_train_batches: 1.0
   limit_val_batches: 1.0
   limit_test_batches: 1.0
 
+model:
+  config:
+    val_closed_loop: true
+    fast_wosac_metric: true

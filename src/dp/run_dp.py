@@ -53,7 +53,7 @@ def run(cfg: DictConfig) -> None:
     # setup model watching
     for _logger in logger:
         if isinstance(_logger, WandbLogger):
-            _logger.watch(model, log="all")
+            _logger.watch(model, log="all", log_freq=100)
 
     log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
     trainer: Trainer = hydra.utils.instantiate(

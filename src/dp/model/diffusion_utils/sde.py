@@ -163,3 +163,81 @@ class subVPSDE_exp(SDE):
         discount = torch.exp(-(self._sigma ** t - 1) / torch.log(self._sigma))
         std = torch.clamp(1 - discount, min=STD_MIN)
         return std
+
+import torch
+
+class VPSDE_LogSNR(SDE):
+    def __init__(self, log_snr_max=10.0, log_snr_min=-10.0):
+        """
+        VPSDE with Linear Log-SNR Noise Schedule
+        
+        lambda(t) = log_snr_max + t * (log_snr_min - log_snr_max)
+        """
+        super().__init__()
+        self.log_snr_max = log_snr_max
+        self.log_snr_min = log_snr_min
+
+    @property
+    def T(self):
+        return 1.0
+
+    def _get_alpha2_sigma2(self, t):
+        """辅助函数：根据时间 t 计算 alpha^2 和 sigma^2"""
+        # 线性插值计算当前的对数信噪比 lambda(t)
+        log_snr = self.log_snr_max + t * (self.log_snr_min - self.log_snr_max)
+        
+        # 利用 Sigmoid 函数的性质：
+        # alpha^2 = 1 / (1 + e^(-lambda)) = sigmoid(lambda)
+        # sigma^2 = 1 / (1 + e^(lambda))  = sigmoid(-lambda)
+        alpha2 = torch.sigmoid(log_snr)
+        sigma2 = torch.sigmoid(-log_snr)
+        return alpha2, sigma2
+
+    def sde(self, x, t):
+        shape = x.shape
+        reshape = [-1] + [1, ] * (len(shape) - 1)
+        t = t.reshape(reshape)
+
+        alpha2, sigma2 = self._get_alpha2_sigma2(t)
+        
+        # lambda'(t) = log_snr_min - log_snr_max
+        lambda_prime = self.log_snr_min - self.log_snr_max
+        
+        # beta(t) = -lambda'(t) * sigma^2(t)
+        beta_t = -lambda_prime * sigma2
+        
+        # 标准 VPSDE 的漂移项和扩散项
+        drift = - 0.5 * beta_t * x
+        diffusion = torch.sqrt(beta_t)
+
+        return drift, diffusion
+
+    def marginal_prob(self, x, t):
+        shape = x.shape
+        reshape = [-1] + [1, ] * (len(shape) - 1)
+        t = t.reshape(reshape)
+        
+        alpha2, sigma2 = self._get_alpha2_sigma2(t)
+        
+        # 均值系数为 alpha(t) = sqrt(alpha^2)
+        mean = torch.sqrt(alpha2) * x
+        # 标准差为 sigma(t) = sqrt(sigma^2)
+        std = torch.sqrt(sigma2)
+        std = torch.clamp(std, min=STD_MIN)
+        
+        return mean, std
+
+    def diffusion_coeff(self, t):
+        # 这里的张量对齐可以直接在外面处理或参考原代码
+        alpha2, sigma2 = self._get_alpha2_sigma2(t)
+        lambda_prime = self.log_snr_min - self.log_snr_max
+        beta_t = -lambda_prime * sigma2
+        
+        diffusion = torch.sqrt(beta_t)
+        return diffusion
+
+    def marginal_prob_std(self, t):
+        alpha2, sigma2 = self._get_alpha2_sigma2(t)
+        std = torch.sqrt(sigma2)
+        std = torch.clamp(std, min=STD_MIN)
+        return std

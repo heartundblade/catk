@@ -1,7 +1,6 @@
 import torch
 # import random
 import numpy as np
-# from mmengine import fileio
 # import io
 # import os
 import json
@@ -119,16 +118,19 @@ def transform_coords_to_global_frame(coords, sdc_states):
         return torch.matmul(vectors.unsqueeze(-2), inv_rotation_matrix[:, None, None, :, :]).squeeze(-2)
     
     rotated = rotate_vectors(coords[..., :2])
-    heading_rotated = rotate_vectors(coords[..., 2:4])
-    
     translated = rotated + sdc_states[:, None, None, :2]
-    
-    if coords.shape[-1] == 4:
+
+    if coords.shape[-1] == 2:
+        valid_translated = translated[valid_mask]
+        transformed[..., 0:2][valid_mask] = valid_translated
+    elif coords.shape[-1] == 4:
+        heading_rotated = rotate_vectors(coords[..., 2:4])
         valid_translated = translated[valid_mask]
         valid_heading = heading_rotated[valid_mask]
         transformed[..., 0:2][valid_mask] = valid_translated
         transformed[..., 2:4][valid_mask] = valid_heading
     elif coords.shape[-1] == 6:
+        heading_rotated = rotate_vectors(coords[..., 2:4])
         vel_rotated = rotate_vectors(coords[..., 4:6])
         
         valid_translated = translated[valid_mask]
@@ -187,6 +189,7 @@ def inverse_kinematics(
     yaw_rate_sample = yaw_rate.sum(dim=-1) / torch.clamp(action_valid.sum(dim=-1), min=1.0)
     accel_sample = accel.sum(dim=-1) / torch.clamp(action_valid.sum(dim=-1), min=1.0)
     action = torch.stack([accel_sample, yaw_rate_sample], dim=-1)
+    # Account for invalid actions of 2 step
     action_valid = action_valid.any(dim=-1)
     
     # Filter again
@@ -200,18 +203,19 @@ def roll_out(
         actions: torch.Tensor,
         dt: float = 0.1,
         action_len: int = 5,
-        global_frame: float = True
+        global_frame: bool = True,
+        training: bool = False
     ):
         """
         Forward pass of the dynamics model.
 
         Args:
-            current_states (torch.Tensor): Current states tensor of shape [B, N, x, 5]. [x, y, theta, v_x, v_y]
-            actions (torch.Tensor): Inputs tensor of shape [B, N, x, T_f//T_a, 2]. [Accel, yaw_rate]
-            global_frame (bool): Flag indicating whether to use the global frame of reference. Default is False.
+            current_states (torch.Tensor): Current states tensor of shape [B, N, 6]. [x, y, cos_theta, sin_theta, v_x, v_y]
+            actions (torch.Tensor): Inputs tensor of shape [B, N, num_actions, 2]. [Accel, yaw_rate]
+            global_frame (bool): Flag indicating whether to use the global frame of reference. Default is True.
 
         Returns:
-            torch.Tensor: Predicted trajectories.
+            torch.Tensor: Predicted trajectories of shape [B, N, T, 6].
 
         """
         x = current_states[..., 0]
@@ -223,17 +227,18 @@ def roll_out(
 
         a = actions[..., 0].repeat_interleave(action_len, dim=-1) 
         v = v.unsqueeze(-1) + torch.cumsum(a * dt, dim=-1)
-        # TODO: this noise may be unnecessary
-        v += torch.randn_like(v) * 0.1
+        if training:
+            v += torch.randn_like(v) * 0.1
         v = torch.clamp(v, min=0)
 
         yaw_rate = actions[..., 1].repeat_interleave(action_len, dim=-1) 
-        yaw_rate += torch.randn_like(yaw_rate) * 0.01
+        if training:
+            yaw_rate += torch.randn_like(yaw_rate) * 0.01
 
-        if global_frame:
-            theta = theta.unsqueeze(-1) + torch.cumsum(yaw_rate * dt, dim=-1)
-        else:
-            theta = torch.cumsum(yaw_rate * dt, dim=2)
+        # if global_frame:
+        theta = theta.unsqueeze(-1) + torch.cumsum(yaw_rate * dt, dim=-1)
+        # else:
+        #     theta = torch.cumsum(yaw_rate * dt, dim=-1)
 
         # theta = torch.fmod(theta + torch.pi, 2*torch.pi) - torch.pi
         # theta = wrap_angle(theta)
@@ -241,14 +246,17 @@ def roll_out(
         v_x = v * torch.cos(theta)
         v_y = v * torch.sin(theta)
         
-        if global_frame:
-            x = x.unsqueeze(-1) + torch.cumsum(v_x * dt, dim=-1)
-            y = y.unsqueeze(-1) + torch.cumsum(v_y * dt, dim=-1)
-        else:
-            x = torch.cumsum(v_x * dt, dim=-1)
-            y = torch.cumsum(v_y * dt, dim=-1)
+        # if global_frame:
+        x = x.unsqueeze(-1) + torch.cumsum(v_x * dt, dim=-1)
+        y = y.unsqueeze(-1) + torch.cumsum(v_y * dt, dim=-1)
+        # else:
+        #     x = torch.cumsum(v_x * dt, dim=-1)
+        #     y = torch.cumsum(v_y * dt, dim=-1)
 
-        return torch.stack([x, y, theta, v_x, v_y], dim=-1)
+        # Output format: [x, y, cos(theta), sin(theta), v_x, v_y]
+        cos_theta = torch.cos(theta)
+        sin_theta = torch.sin(theta)
+        return torch.stack([x, y, cos_theta, sin_theta, v_x, v_y], dim=-1)  # [B, N, T, 6]
 
 # def opendata(path):
     

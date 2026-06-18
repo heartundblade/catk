@@ -1,6 +1,6 @@
 _target_: src.dp.datamodule.DPDataModule
-train_batch_size: 50
-val_batch_size: 50
+train_batch_size: 40
+val_batch_size: 40
 test_batch_size: 4
 num_workers: 4
 shuffle: true
@@ -8,6 +8,9 @@ pin_memory: true
 persistent_workers: true
 train_raw_dir: ${paths.cache_root}/training
 val_raw_dir: ${paths.cache_root}/validation
-val_tfrecords_splitted: ${paths.cache_root}/validation_tfrecords_splitted
-val_gt_scenario_dir: ${paths.cache_root}/validation_gt
+# val_tfrecords_splitted: ${paths.cache_root}/validation_tfrecords_splitted
+val_tfrecords_splitted: /home/zhanghailiang/Repos/catk/data_new/validation_tfrecords_splitted
+# val_gt_scenario_dir: ${paths.cache_root}/validation_gt
+val_gt_scenario_dir: /home/zhanghailiang/Repos/catk/data_new/validation_gt
 test_raw_dir: ${paths.cache_root}/testing
+anchor_path: ${paths.root_dir}/src/dp/data/cluster_64_center_dict.pkl

@@ -17,6 +17,7 @@ class DPDataModule(LightningDataModule):
         train_raw_dir: str,
         val_raw_dir: str,
         test_raw_dir: str,
+        anchor_path: str,
         val_tfrecords_splitted: str,
         val_gt_scenario_dir: str,
         shuffle: bool,
@@ -38,22 +39,26 @@ class DPDataModule(LightningDataModule):
 
         self.val_tfrecords_splitted = val_tfrecords_splitted
         self.val_gt_scenario_dir = val_gt_scenario_dir
+        self.anchor_path = anchor_path
 
     def setup(self, stage: Optional[str] = None) -> None:
         if stage == "fit" or stage is None:
             self.train_dataset = DPDataset(
                 dp_data_dir=self.train_raw_dir,
+                anchor_path=self.anchor_path,
             )
             self.val_dataset = DPDataset(
                 dp_data_dir=self.val_raw_dir,
                 val_tfrecords_splitted=self.val_tfrecords_splitted,
                 val_gt_scenario_dir=self.val_gt_scenario_dir,
+                anchor_path=self.anchor_path,
             )
         elif stage == "validate":
             self.val_dataset = DPDataset(
                 dp_data_dir=self.val_raw_dir,
                 val_tfrecords_splitted=self.val_tfrecords_splitted,
                 val_gt_scenario_dir=self.val_gt_scenario_dir,
+                anchor_path=self.anchor_path,
             )
         elif stage == "test":
             self.test_dataset = DPDataset(

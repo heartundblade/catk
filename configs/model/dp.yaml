@@ -6,8 +6,6 @@ _target_: src.dp.model.diffusion_planner.Diffusion_Planner
 
 config:
   # Data Settings
-  train_set: null
-  train_set_list: null
   future_len: 80
   time_len: 11
   agent_state_dim: 9
@@ -26,6 +24,7 @@ config:
   # route_len: 20
   # route_state_dim: 12
   # route_num: 25
+  train_predictor: false
 
   # DataLoader Parameters
   augment_prob: 0.5
@@ -38,7 +37,7 @@ config:
   seed: 3407
   train_epochs: 500
   save_utd: 20
-  batch_size: 2048
+  # batch_size: 2048
   learning_rate: 5e-4
   warm_up_epoch: 5
   encoder_drop_path_rate: 0.1
@@ -57,6 +56,7 @@ config:
   # Decoder Parameters
   predicted_neighbor_num: 63
   resume_model_path: null
+  action_len: 2
 
   # Guidance Function
   guidance_fn: null
@@ -66,7 +66,7 @@ config:
   val_open_loop: true
   val_closed_loop: false
   fast_wosac_metric: false
-  n_rollout_closed_val: 1
+  n_rollout_closed_val: 32
   log_epoch: -1
   wosac_submission: 
     is_active: false

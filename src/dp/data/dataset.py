@@ -18,6 +18,7 @@ class DPDataset(Dataset):
             dp_data_dir, 
             val_tfrecords_splitted=None,
             val_gt_scenario_dir=None,
+            anchor_path=None,
         ):
         """
         Data class for transforming smart data to vbd input format.
@@ -28,6 +29,7 @@ class DPDataset(Dataset):
         self.dp_data_dir = dp_data_dir
         self.file_list = glob.glob(dp_data_dir+'/*') if dp_data_dir is not None else []
 
+        self.anchors = pickle.load(open(anchor_path, "rb"))
         self._tfrecord_dir = Path(val_tfrecords_splitted) if val_tfrecords_splitted is not None else None
         self._gt_scenario_dir = Path(val_gt_scenario_dir) if val_gt_scenario_dir is not None else None
         
@@ -49,6 +51,30 @@ class DPDataset(Dataset):
             with open(gt_path, "rb") as handle:
                 data["gt_scenario"] = SimpleNamespace(value=pickle.load(handle))
         return data
+
+    def get_anchors(self, types):
+        """
+        Process the agent types and convert them into anchor vectors.
+
+        Args:
+            types (numpy.ndarray): Array of agent types.
+
+        Returns:
+            numpy.ndarray: Array of anchor vectors.
+        """
+        anchors = []
+
+        for i in range(len(types)):
+            if types[i] == 1:
+                anchors.append(self.anchors['TYPE_VEHICLE'])
+            elif types[i] == 2:
+                anchors.append(self.anchors['TYPE_PEDESTRIAN'])
+            elif types[i] == 3:
+                anchors.append(self.anchors['TYPE_CYCLIST'])
+            else:
+                anchors.append(np.zeros_like(self.anchors['TYPE_VEHICLE']))
+
+        return np.array(anchors, dtype=np.float32)
 
     def convert_to_tensor(self, data):
         """
@@ -78,6 +104,7 @@ class DPDataset(Dataset):
         agents_id = data['agents_id']
         agents_history_remaining = data['agents_history_remaining']
         agents_id_remaining = data['agents_id_remaining']
+        anchors = self.get_anchors(agents_type)
 
         tensors = {
             "sdc_coord": torch.from_numpy(sdc_coord),
@@ -95,6 +122,7 @@ class DPDataset(Dataset):
             "roadlines_valid": torch.from_numpy(roadlines_valid),
             "static_maps": torch.from_numpy(static_maps),
             "static_maps_valid": torch.from_numpy(static_maps_valid),
+            "anchors": torch.from_numpy(anchors),
             'agents_id': torch.from_numpy(agents_id),
             'agents_history_remaining': torch.from_numpy(agents_history_remaining),
             'agents_id_remaining': torch.from_numpy(agents_id_remaining),

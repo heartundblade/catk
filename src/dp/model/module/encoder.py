@@ -15,9 +15,35 @@ class Encoder(nn.Module):
         self.token_num = config.agent_num + config.static_map_num + config.lane_num + config.roadline_num
 
         self.agents_encoder = AgentFusionEncoder(config.time_len, drop_path_rate=config.encoder_drop_path_rate, hidden_dim=config.hidden_dim, depth=config.encoder_depth)
-        self.static_map_encoder = StaticMapFusionEncoder(config.static_map_len, drop_path_rate=config.encoder_drop_path_rate, hidden_dim=config.hidden_dim)
-        self.lane_encoder = LaneFusionEncoder(config.lane_len, drop_path_rate=config.encoder_drop_path_rate, hidden_dim=config.hidden_dim, depth=config.encoder_depth)
-        self.roadline_encoder = RoadlineFusionEncoder(config.roadline_len, drop_path_rate=config.encoder_drop_path_rate, hidden_dim=config.hidden_dim, depth=config.encoder_depth)
+
+        # Create shared backbone for static_maps, lanes and roadlines
+        # This shares the position encoding matrix (channel_pre_project),
+        # all MixerBlocks, and the final projection layer among the three encoders
+        self.vector_map_backbone = VectorMapBackbone(
+            channels_mlp_dim=128,
+            tokens_mlp_dim=64,
+            hidden_dim=config.hidden_dim,
+            depth=config.encoder_depth,
+            drop_path_rate=config.encoder_drop_path_rate
+        )
+        self.static_map_encoder = StaticMapFusionEncoder(
+            config.static_map_len, drop_path_rate=config.encoder_drop_path_rate, hidden_dim=config.hidden_dim,
+            shared_backbone=self.vector_map_backbone
+        )
+        self.lane_encoder = LaneFusionEncoder(
+            config.lane_len,
+            drop_path_rate=config.encoder_drop_path_rate,
+            hidden_dim=config.hidden_dim,
+            depth=config.encoder_depth,
+            shared_backbone=self.vector_map_backbone
+        )
+        self.roadline_encoder = RoadlineFusionEncoder(
+            config.roadline_len,
+            drop_path_rate=config.encoder_drop_path_rate,
+            hidden_dim=config.hidden_dim,
+            depth=config.encoder_depth,
+            shared_backbone=self.vector_map_backbone
+        )
 
         self.fusion = FusionEncoder(
             hidden_dim=config.hidden_dim, 
@@ -65,6 +91,57 @@ class Encoder(nn.Module):
         encoder_outputs['encoding'] = self.fusion(encoding_input, encoding_mask.view(B, self.token_num))
 
         return encoder_outputs
+
+
+class VectorMapBackbone(nn.Module):
+    """
+    Shared backbone for vector map encoders (lanes, roadlines, static_maps).
+    Shares the spatial position encoding (channel_pre_project), MixerBlocks,
+    normalization, and final projection between lane and roadline encoders.
+
+    NOTE: token_pre_project is NOT shared because lane and roadline have
+    different sequence lengths (lane_len vs roadline_len).
+    """
+    def __init__(self, channels_mlp_dim=128, tokens_mlp_dim=64, hidden_dim=192,
+                 depth=3, drop_path_rate=0.3):
+        super().__init__()
+
+        self.channel_pre_project = Mlp(
+            in_features=4, hidden_features=channels_mlp_dim,
+            out_features=channels_mlp_dim, act_layer=nn.GELU, drop=0.
+        )
+        self.blocks = nn.ModuleList([
+            MixerBlock(tokens_mlp_dim, channels_mlp_dim, drop_path_rate)
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(channels_mlp_dim)
+        self.emb_project = Mlp(
+            in_features=channels_mlp_dim, hidden_features=hidden_dim,
+            out_features=hidden_dim, act_layer=nn.GELU, drop=drop_path_rate
+        )
+
+    def mix(self, x):
+        """
+        MixerBlocks + mean pooling.
+        Args:
+            x: [N, V, channels_mlp_dim]  after channel_pre_project + token_pre_project
+        Returns:
+            x: [N, channels_mlp_dim]
+        """
+        for block in self.blocks:
+            x = block(x)
+        x = torch.mean(x, dim=1)
+        return x
+
+    def proj(self, x):
+        """
+        LayerNorm + final projection.
+        Args:
+            x: [N, channels_mlp_dim]
+        Returns:
+            x: [N, hidden_dim]
+        """
+        return self.emb_project(self.norm(x))
 
 
 class SelfAttentionBlock(nn.Module):
@@ -148,26 +225,28 @@ class AgentFusionEncoder(nn.Module):
 
 
 class StaticMapFusionEncoder(nn.Module):
-    def __init__(self, static_map_len, drop_path_rate=0.3, depth=3, tokens_mlp_dim=64, hidden_dim=192, channels_mlp_dim=128, device='cuda'):
+    def __init__(self, static_map_len, drop_path_rate=0.3, depth=3, tokens_mlp_dim=64, hidden_dim=192, channels_mlp_dim=128, device='cuda',
+                 shared_backbone: VectorMapBackbone = None):
         super().__init__()
 
         self._hidden_dim = hidden_dim
-        self.type_emb = nn.Embedding(3, hidden_dim)
-
-        # self.projection = Mlp(in_features=dim, hidden_features=hidden_dim, out_features=hidden_dim, act_layer=nn.GELU, drop=drop_path_rate)
 
         self._map_len = static_map_len
         self._channel = channels_mlp_dim
 
         self.type_emb = nn.Embedding(3, channels_mlp_dim)
 
-        self.channel_pre_project = Mlp(in_features=4, hidden_features=channels_mlp_dim, out_features=channels_mlp_dim, act_layer=nn.GELU, drop=0.)
-        self.token_pre_project = Mlp(in_features=static_map_len, hidden_features=tokens_mlp_dim, out_features=tokens_mlp_dim, act_layer=nn.GELU, drop=0.)
+        self.token_pre_project = Mlp(
+            in_features=static_map_len, hidden_features=tokens_mlp_dim,
+            out_features=tokens_mlp_dim, act_layer=nn.GELU, drop=0.
+        )
 
-        self.blocks = nn.ModuleList([MixerBlock(tokens_mlp_dim, channels_mlp_dim, drop_path_rate) for i in range(depth)])
-
-        self.norm = nn.LayerNorm(channels_mlp_dim)
-        self.emb_project = Mlp(in_features=channels_mlp_dim, hidden_features=hidden_dim, out_features=hidden_dim, act_layer=nn.GELU, drop=drop_path_rate)
+        if shared_backbone is not None:
+            self.backbone = shared_backbone
+        else:
+            self.backbone = VectorMapBackbone(
+                channels_mlp_dim, tokens_mlp_dim, hidden_dim, depth, drop_path_rate
+            )
 
     def forward(self, x):
         '''
@@ -191,21 +270,18 @@ class StaticMapFusionEncoder(nn.Module):
         valid_indices = ~mask_p.view(-1) 
         x = x[valid_indices] 
 
-        x = self.channel_pre_project(x)
+        x = self.backbone.channel_pre_project(x)
         x = x.permute(0, 2, 1)
         x = self.token_pre_project(x)
         x = x.permute(0, 2, 1)
-        for block in self.blocks:
-            x = block(x)
-
-        x = torch.mean(x, dim=1)
+        x = self.backbone.mix(x)
 
         static_map_type = static_map_type.long().view(B * P)
         static_map_type = static_map_type[valid_indices]
         type_embedding = self.type_emb(static_map_type)
         
         x = x + type_embedding
-        x = self.emb_project(self.norm(x))
+        x = self.backbone.proj(x)
 
         x_result = torch.zeros((B * P, x.shape[-1]), device=x.device)
         x_result[valid_indices] = x  # Fill in valid parts
@@ -214,7 +290,8 @@ class StaticMapFusionEncoder(nn.Module):
 
 
 class LaneFusionEncoder(nn.Module):
-    def __init__(self, lane_len, drop_path_rate=0.3, hidden_dim=192, depth=3, tokens_mlp_dim=64, channels_mlp_dim=128):
+    def __init__(self, lane_len, drop_path_rate=0.3, hidden_dim=192, depth=3, tokens_mlp_dim=64, channels_mlp_dim=128,
+                 shared_backbone: VectorMapBackbone = None):
         super().__init__()
 
         self._lane_len = lane_len
@@ -225,13 +302,17 @@ class LaneFusionEncoder(nn.Module):
         self.traffic_emb = nn.Embedding(9, channels_mlp_dim)
         self.type_emb = nn.Embedding(4, channels_mlp_dim)
 
-        self.channel_pre_project = Mlp(in_features=4, hidden_features=channels_mlp_dim, out_features=channels_mlp_dim, act_layer=nn.GELU, drop=0.)
-        self.token_pre_project = Mlp(in_features=lane_len, hidden_features=tokens_mlp_dim, out_features=tokens_mlp_dim, act_layer=nn.GELU, drop=0.)
+        self.token_pre_project = Mlp(
+            in_features=lane_len, hidden_features=tokens_mlp_dim,
+            out_features=tokens_mlp_dim, act_layer=nn.GELU, drop=0.
+        )
 
-        self.blocks = nn.ModuleList([MixerBlock(tokens_mlp_dim, channels_mlp_dim, drop_path_rate) for i in range(depth)])
-
-        self.norm = nn.LayerNorm(channels_mlp_dim)
-        self.emb_project = Mlp(in_features=channels_mlp_dim, hidden_features=hidden_dim, out_features=hidden_dim, act_layer=nn.GELU, drop=drop_path_rate)
+        if shared_backbone is not None:
+            self.backbone = shared_backbone
+        else:
+            self.backbone = VectorMapBackbone(
+                channels_mlp_dim, tokens_mlp_dim, hidden_dim, depth, drop_path_rate
+            )
 
     def forward(self, x, speed_limit, has_speed_limit):
         '''
@@ -259,14 +340,11 @@ class LaneFusionEncoder(nn.Module):
         valid_indices = ~mask_p.view(-1) 
         x = x[valid_indices] 
 
-        x = self.channel_pre_project(x)
+        x = self.backbone.channel_pre_project(x)
         x = x.permute(0, 2, 1)
         x = self.token_pre_project(x)
         x = x.permute(0, 2, 1)
-        for block in self.blocks:
-            x = block(x)  
-
-        x = torch.mean(x, dim=1)
+        x = self.backbone.mix(x)
 
         # Reshape speed_limit and traffic to match flattened dimensions
         speed_limit = speed_limit.view(B * P, 1)
@@ -308,7 +386,7 @@ class LaneFusionEncoder(nn.Module):
         type_embedding = self.type_emb(lane_type)
 
         x = x + speed_limit_embedding + traffic_light_embedding + type_embedding
-        x = self.emb_project(self.norm(x))
+        x = self.backbone.proj(x)
 
         x_result = torch.zeros((B * P, x.shape[-1]), device=x.device)
         x_result[valid_indices] = x  # Fill in valid parts
@@ -316,7 +394,8 @@ class LaneFusionEncoder(nn.Module):
         return x_result.view(B, P, -1) , mask_p.reshape(B, -1), pos.view(B, P, -1)
 
 class RoadlineFusionEncoder(nn.Module):
-    def __init__(self, roadline_len, drop_path_rate=0.3, hidden_dim=192, depth=3, tokens_mlp_dim=64, channels_mlp_dim=128):
+    def __init__(self, roadline_len, drop_path_rate=0.3, hidden_dim=192, depth=3, tokens_mlp_dim=64, channels_mlp_dim=128,
+                 shared_backbone: VectorMapBackbone = None):
         super().__init__()
 
         self._roadline_len = roadline_len
@@ -324,20 +403,24 @@ class RoadlineFusionEncoder(nn.Module):
 
         self.type_emb = nn.Embedding(12, channels_mlp_dim)
 
-        self.channel_pre_project = Mlp(in_features=4, hidden_features=channels_mlp_dim, out_features=channels_mlp_dim, act_layer=nn.GELU, drop=0.)
-        self.token_pre_project = Mlp(in_features=roadline_len, hidden_features=tokens_mlp_dim, out_features=tokens_mlp_dim, act_layer=nn.GELU, drop=0.)
+        self.token_pre_project = Mlp(
+            in_features=roadline_len, hidden_features=tokens_mlp_dim,
+            out_features=tokens_mlp_dim, act_layer=nn.GELU, drop=0.
+        )
 
-        self.blocks = nn.ModuleList([MixerBlock(tokens_mlp_dim, channels_mlp_dim, drop_path_rate) for i in range(depth)])
-
-        self.norm = nn.LayerNorm(channels_mlp_dim)
-        self.emb_project = Mlp(in_features=channels_mlp_dim, hidden_features=hidden_dim, out_features=hidden_dim, act_layer=nn.GELU, drop=drop_path_rate)
+        if shared_backbone is not None:
+            self.backbone = shared_backbone
+        else:
+            self.backbone = VectorMapBackbone(
+                channels_mlp_dim, tokens_mlp_dim, hidden_dim, depth, drop_path_rate
+            )
 
     def forward(self, x):
         '''
         x: B, P, V, D (x, y, cos, sin, type)
         '''
         B, P, V, _ = x.shape
-        roadline_type = x[:, :, 0, 4:]
+        roadline_type = x[:, :, 0, 4]
         x = x[..., :4]
 
         spatial_pos = x[:, :, int(self._roadline_len / 2), :4].clone()
@@ -352,23 +435,20 @@ class RoadlineFusionEncoder(nn.Module):
         x = x.view(B * P, V, -1)
 
         valid_indices = ~mask_p.view(-1) 
-        x = x[valid_indices] 
+        x = x[valid_indices]
 
-        x = self.channel_pre_project(x)
+        x = self.backbone.channel_pre_project(x)
         x = x.permute(0, 2, 1)
         x = self.token_pre_project(x)
         x = x.permute(0, 2, 1)
-        for block in self.blocks:
-            x = block(x)
-
-        x = torch.mean(x, dim=1)
+        x = self.backbone.mix(x)
 
         roadline_type = roadline_type.long().view(B * P)
         roadline_type = roadline_type[valid_indices]
         type_embedding = self.type_emb(roadline_type)
         
         x = x + type_embedding
-        x = self.emb_project(self.norm(x))
+        x = self.backbone.proj(x)
 
         x_result = torch.zeros((B * P, x.shape[-1]), device=x.device)
         x_result[valid_indices] = x  # Fill in valid parts
