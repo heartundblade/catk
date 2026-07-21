@@ -21,9 +21,7 @@ config:
   static_map_len: 10
   static_map_state_dim: 3
   static_map_num: 20
-  # route_len: 20
-  # route_state_dim: 12
-  # route_num: 25
+  traffic_light_num: 20
   train_predictor: false
 
   # DataLoader Parameters
@@ -37,7 +35,6 @@ config:
   seed: 3407
   train_epochs: 500
   save_utd: 20
-  # batch_size: 2048
   learning_rate: 5e-4
   warm_up_epoch: 5
   encoder_drop_path_rate: 0.1
@@ -47,15 +44,19 @@ config:
   use_ema: true
 
   # Model Parameters
+  polyline_encoder_depth: 2
   encoder_depth: 3
   decoder_depth: 3
   num_heads: 6
   hidden_dim: 192
+  local_attn_k: 16
+  top_k_intention: 6
+  num_modes: 6
+  num_intention_points: 64
   diffusion_model_type: "x_start"
 
   # Decoder Parameters
   predicted_neighbor_num: 63
-  resume_model_path: null
   action_len: 2
 
   # Guidance Function

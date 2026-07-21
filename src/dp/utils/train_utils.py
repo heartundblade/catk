@@ -144,6 +144,235 @@ def transform_coords_to_global_frame(coords, sdc_states):
     
     return transformed
 
+def batch_transform_maps_to_local_frame(maps):
+    """
+    Batch transform map elements to local frame. Uses first point as reference.
+
+    Args:
+        maps (torch.Tensor): Map tensor of shape [B, N, P, D] with D >= 4 (x, y, cos, sin, ...).
+
+    Returns:
+        torch.Tensor: Transformed maps in local frame.
+    """
+    x = maps[..., 0]
+    y = maps[..., 1]
+    cos = maps[..., 2]
+    sin = maps[..., 3]
+
+    ref_idx = maps.shape[2] // 2
+    # ref_idx = 0
+    ref_cos = cos[:, :, ref_idx]
+    ref_sin = sin[:, :, ref_idx]
+    ref_x = x[:, :, ref_idx]
+    ref_y = y[:, :, ref_idx]
+
+    dx = x - ref_x[:, :, None]
+    dy = y - ref_y[:, :, None]
+
+    local_x = dx * ref_cos[:, :, None] + dy * ref_sin[:, :, None]
+    local_y = -dx * ref_sin[:, :, None] + dy * ref_cos[:, :, None]
+
+    local_cos = cos * ref_cos[:, :, None] + sin * ref_sin[:, :, None]
+    local_sin = -cos * ref_sin[:, :, None] + sin * ref_cos[:, :, None]
+
+    local_maps = torch.stack([local_x, local_y, local_cos, local_sin], dim=-1)
+    local_maps[maps[..., :4] == 0] = 0
+
+    if maps.shape[-1] > 4:
+        maps = torch.cat([local_maps, maps[..., 4:]], dim=-1)
+    else:
+        maps = local_maps
+
+    return maps
+
+
+def batch_transform_trajs_to_local_frame(trajs, ref_idx=-1):
+    """
+    Batch transform trajectories to the local frame of reference.
+    Supports DP format: [x, y, cos, sin, vx, vy, ...] (D>=6) or [x, y, cos, sin] (D=4).
+
+    Args:
+        trajs (torch.Tensor): Trajectories tensor of shape [B, N, T, D].
+        ref_idx (int): Reference index for the local frame. Default is -1.
+
+    Returns:
+        torch.Tensor: Transformed trajectories in the local frame.
+    """
+    D = trajs.shape[-1]
+    x = trajs[..., 0]
+    y = trajs[..., 1]
+    cos = trajs[..., 2]
+    sin = trajs[..., 3]
+
+    ref_cos = cos[:, :, ref_idx]
+    ref_sin = sin[:, :, ref_idx]
+    ref_x = x[:, :, ref_idx]
+    ref_y = y[:, :, ref_idx]
+
+    dx = x - ref_x[:, :, None]
+    dy = y - ref_y[:, :, None]
+
+    local_x = dx * ref_cos[:, :, None] + dy * ref_sin[:, :, None]
+    local_y = -dx * ref_sin[:, :, None] + dy * ref_cos[:, :, None]
+
+    local_cos = cos * ref_cos[:, :, None] + sin * ref_sin[:, :, None]
+    local_sin = -cos * ref_sin[:, :, None] + sin * ref_cos[:, :, None]
+
+    if D == 4:
+        local_trajs = torch.stack([local_x, local_y, local_cos, local_sin], dim=-1)
+        local_trajs[trajs[..., :4] == 0] = 0
+        return local_trajs
+
+    v_x = trajs[..., 4]
+    v_y = trajs[..., 5]
+
+    local_v_x = v_x * ref_cos[:, :, None] + v_y * ref_sin[:, :, None]
+    local_v_y = -v_x * ref_sin[:, :, None] + v_y * ref_cos[:, :, None]
+
+    local_trajs = torch.stack([local_x, local_y, local_cos, local_sin, local_v_x, local_v_y], dim=-1)
+    local_trajs[trajs[..., :6] == 0] = 0
+
+    if D > 6:
+        trajs = torch.cat([local_trajs, trajs[..., 6:]], dim=-1)
+    else:
+        trajs = local_trajs
+
+    return trajs
+
+
+def batch_transform_trajs_to_global_frame(trajs, ref_states):
+    """
+    Batch transform trajectories from local frame to global frame.
+    Inverse of batch_transform_trajs_to_local_frame.
+
+    Args:
+        trajs (torch.Tensor): Local trajectories tensor of shape [B, N, T, 4].
+            [x, y, cos(heading), sin(heading)] in local frame.
+        ref_states (torch.Tensor): Reference states tensor of shape [B, N, 4].
+            [x, y, cos(heading), sin(heading)] in global frame.
+
+    Returns:
+        torch.Tensor: Transformed trajectories in global frame. [B, N, T, 4]
+    """
+    ref_x = ref_states[..., 0]
+    ref_y = ref_states[..., 1]
+    ref_cos = ref_states[..., 2]
+    ref_sin = ref_states[..., 3]
+
+    local_x = trajs[..., 0]
+    local_y = trajs[..., 1]
+    local_cos = trajs[..., 2]
+    local_sin = trajs[..., 3]
+
+    global_x = ref_x[..., None] + local_x * ref_cos[..., None] - local_y * ref_sin[..., None]
+    global_y = ref_y[..., None] + local_x * ref_sin[..., None] + local_y * ref_cos[..., None]
+    global_cos = ref_cos[..., None] * local_cos - ref_sin[..., None] * local_sin
+    global_sin = ref_sin[..., None] * local_cos + ref_cos[..., None] * local_sin
+
+    global_trajs = torch.stack([global_x, global_y, global_cos, global_sin], dim=-1)
+    return global_trajs
+
+
+@torch.no_grad()
+def batch_calculate_relations(
+    agents_history: torch.Tensor,
+    static_maps: torch.Tensor,
+    lanes: torch.Tensor,
+    roadlines: torch.Tensor,
+    traffic_lights: torch.Tensor = None,
+    encoding_mask: torch.Tensor = None,
+    device: str = 'cpu'
+):
+    """
+    Calculate relations between agents, lanes, roadlines, static maps, and traffic lights.
+
+    Args:
+        agents_history (torch.Tensor): Agent history tensor of shape [B, N, T, D]. [x, y, cos(theta), sin(theta), ...]
+        lanes (torch.Tensor): Lanes tensor of shape [B, N, T, D]. [x, y, cos(theta), sin(theta), ...]
+        roadlines (torch.Tensor): Roadlines tensor of shape [B, N, T, D]. [x, y, cos(theta), sin(theta), ...]
+        static_maps (torch.Tensor): Static maps tensor of shape [B, N, T, D]. [x, y, cos(theta), sin(theta), ...]
+        traffic_lights (torch.Tensor): Traffic lights tensor of shape [B, TL, 3]. [x, y, state]. Default is None.
+        device (str): Device to use. Default is 'cpu'.
+
+    Returns:
+        torch.Tensor: Relations tensor of shape [B, N_total, N_total, 4]. [local_pos_x, local_pos_y, cos_theta_diff, sin_theta_diff]
+    """
+    batch_size = agents_history.shape[0]
+    n_agents = agents_history.shape[1]
+    n_lanes = lanes.shape[1]
+    n_roadlines = roadlines.shape[1]
+    n_static_maps = static_maps.shape[1]
+    n_traffic_lights = traffic_lights.shape[1] if traffic_lights is not None else 0
+    n = n_agents + n_lanes + n_roadlines + n_static_maps + n_traffic_lights
+
+    # Store (x, y, cos, sin) directly — avoid atan2→cos/sin round-trip
+    agents_elem = agents_history[:, :, -1, :4]
+
+    lanes_elem = lanes[:, :, lanes.shape[2] // 2, :4]
+    roadlines_elem = roadlines[:, :, roadlines.shape[2] // 2, :4]
+    static_maps_elem = static_maps[:, :, static_maps.shape[2] // 2, :4]
+    # lanes_elem = lanes[:, :, 0, :4]
+    # roadlines_elem = roadlines[:, :, 0, :4]
+    # static_maps_elem = static_maps[:, :, 0, :4]
+
+    # Traffic lights: (x, y, cos=1, sin=0) — no orientation
+    if traffic_lights is not None:
+        tl_xy = traffic_lights[..., :2]
+        tl_cos = torch.ones_like(tl_xy[..., 0])
+        tl_sin = torch.zeros_like(tl_xy[..., 0])
+        traffic_lights_elem = torch.stack([tl_xy[..., 0], tl_xy[..., 1], tl_cos, tl_sin], dim=-1)
+    else:
+        traffic_lights_elem = None
+
+    # Concatenate all elements
+    elem_list = [agents_elem, static_maps_elem, lanes_elem, roadlines_elem]
+    if traffic_lights_elem is not None:
+        elem_list.append(traffic_lights_elem)
+    all_elements = torch.cat(elem_list, dim=1)
+
+    # Compute pairwise differences using broadcasting
+    pos_diff = all_elements[:, :, :2][:, :, None, :] - all_elements[:, :, :2][:, None, :, :]
+
+    # Compute local position using stored cos/sin (no trig calls)
+    cos_i = all_elements[:, :, 2][:, :, None]  # [B, N, 1]
+    sin_i = all_elements[:, :, 3][:, :, None]  # [B, N, 1]
+    local_pos_x = pos_diff[..., 0] * cos_i + pos_diff[..., 1] * sin_i
+    local_pos_y = -pos_diff[..., 0] * sin_i + pos_diff[..., 1] * cos_i
+
+    # Compute cos/sin of angle differences using trig identities (no atan2/wrap_angle/cos/sin)
+    cos_j = all_elements[:, :, 2][:, None, :]  # [B, 1, N]
+    sin_j = all_elements[:, :, 3][:, None, :]  # [B, 1, N]
+    cos_theta_diff = cos_i * cos_j + sin_i * sin_j
+    sin_theta_diff = sin_i * cos_j - cos_i * sin_j
+
+    # Set theta_diff to zero for traffic light pairs (traffic lights have no orientation)
+    start_idx = n_agents + n_lanes + n_roadlines + n_static_maps
+    tl_mask = (torch.arange(n, device=device) >= start_idx).repeat(batch_size, 1)
+    tl_pair_mask = tl_mask[:, :, None] | tl_mask[:, None, :]
+    cos_theta_diff = torch.where(tl_pair_mask, 1.0, cos_theta_diff)
+    sin_theta_diff = torch.where(tl_pair_mask, 0.0, sin_theta_diff)
+
+    # Set the diagonal of the differences to a very small value
+    diag_mask = torch.eye(n, dtype=bool, device=device)
+    epsilon = 1e-5
+    local_pos_x = torch.where(diag_mask, epsilon, local_pos_x)
+    local_pos_y = torch.where(diag_mask, epsilon, local_pos_y)
+    cos_theta_diff = torch.where(diag_mask, epsilon, cos_theta_diff)
+    sin_theta_diff = torch.where(diag_mask, epsilon, sin_theta_diff)
+
+    # Zero out relations for masked tokens (using real mask, not x==0 heuristic)
+    if encoding_mask is not None:
+        zero_mask = torch.logical_or(encoding_mask.unsqueeze(2), encoding_mask.unsqueeze(1))
+    else:
+        zero_mask = torch.logical_or(all_elements[:, :, 0][:, :, None] == 0, all_elements[:, :, 0][:, None, :] == 0)
+
+    relations = torch.stack([local_pos_x, local_pos_y, cos_theta_diff, sin_theta_diff], dim=-1)
+
+    # Apply zero mask
+    relations = torch.where(zero_mask[..., None], 0.0, relations)
+
+    return relations, all_elements
+
 def inverse_kinematics(
     agents_future: torch.Tensor,
     agents_future_valid: torch.Tensor,
@@ -204,7 +433,8 @@ def roll_out(
         dt: float = 0.1,
         action_len: int = 5,
         global_frame: bool = True,
-        training: bool = False
+        training: bool = False,
+        valid_mask: torch.Tensor = None,
     ):
         """
         Forward pass of the dynamics model.
@@ -213,6 +443,7 @@ def roll_out(
             current_states (torch.Tensor): Current states tensor of shape [B, N, 6]. [x, y, cos_theta, sin_theta, v_x, v_y]
             actions (torch.Tensor): Inputs tensor of shape [B, N, num_actions, 2]. [Accel, yaw_rate]
             global_frame (bool): Flag indicating whether to use the global frame of reference. Default is True.
+            valid_mask (torch.Tensor): Optional mask of shape [B, N] indicating valid agents. Invalid agents' trajectories will be zeroed out.
 
         Returns:
             torch.Tensor: Predicted trajectories of shape [B, N, T, 6].
@@ -241,7 +472,7 @@ def roll_out(
         #     theta = torch.cumsum(yaw_rate * dt, dim=-1)
 
         # theta = torch.fmod(theta + torch.pi, 2*torch.pi) - torch.pi
-        # theta = wrap_angle(theta)
+        theta = wrap_angle(theta)
         
         v_x = v * torch.cos(theta)
         v_y = v * torch.sin(theta)
@@ -256,107 +487,9 @@ def roll_out(
         # Output format: [x, y, cos(theta), sin(theta), v_x, v_y]
         cos_theta = torch.cos(theta)
         sin_theta = torch.sin(theta)
-        return torch.stack([x, y, cos_theta, sin_theta, v_x, v_y], dim=-1)  # [B, N, T, 6]
+        trajectories = torch.stack([x, y, cos_theta, sin_theta, v_x, v_y], dim=-1)  # [B, N, T, 6]
 
-# def opendata(path):
-    
-#     npz_bytes = fileio.get(path)
-#     buff = io.BytesIO(npz_bytes)
-#     npz_data = np.load(buff)
+        if valid_mask is not None:
+            trajectories = trajectories * valid_mask[..., None, None].float()
 
-#     return npz_data
-
-# def set_seed(CUR_SEED):
-#     random.seed(CUR_SEED)
-#     np.random.seed(CUR_SEED)
-#     torch.manual_seed(CUR_SEED)
-#     torch.backends.cudnn.deterministic = True
-#     torch.backends.cudnn.benchmark = False
-
-# def get_epoch_mean_loss(epoch_loss):
-#     epoch_mean_loss = {}
-#     for current_loss in epoch_loss:
-#         for key, value in current_loss.items():
-#             if key in epoch_mean_loss:
-#                 epoch_mean_loss[key].append(value if isinstance(value, (int, float)) else value.item())
-#             else:
-#                 epoch_mean_loss[key] = [value if isinstance(value, (int, float)) else value.item()]
-
-
-#     for key, values in epoch_mean_loss.items():
-#         epoch_mean_loss[key] = np.mean(np.array(values))
-
-#     return epoch_mean_loss
-
-# def save_model(model, optimizer, scheduler, save_path, epoch, train_loss, wandb_id, ema):
-#     """
-#     save the model to path
-#     """
-#     save_model = {'epoch': epoch + 1, 
-#                   'model': model.state_dict(), 
-#                   'ema_state_dict': ema.state_dict(),
-#                   'optimizer': optimizer.state_dict(), 
-#                   'schedule': scheduler.state_dict(), 
-#                   'loss': train_loss,
-#                   'wandb_id': wandb_id}
-
-#     with io.BytesIO() as f:
-#         torch.save(save_model, f)
-#         fileio.put(f.getvalue(), f'{save_path}/model_epoch_{epoch+1}_trainloss_{train_loss:.4f}.pth')
-#         fileio.put(f.getvalue(), f"{save_path}/latest.pth")
-
-# def resume_model(path: str, model, optimizer, scheduler, ema, device):
-#     """
-#     load ckpt from path
-#     """
-#     path = os.path.join(path, 'latest.pth')
-#     ckpt = fileio.get(path)
-#     with io.BytesIO(ckpt) as f:
-#         ckpt = torch.load(f)
-
-#     # load model
-#     try:
-#         model.load_state_dict(ckpt['model'])
-#     except:
-#         model.load_state_dict(ckpt)                   
-#     print("Model load done")
-    
-#     # load optimizer
-#     try:
-#         optimizer.load_state_dict(ckpt['optimizer'])
-#         print("Optimizer load done")
-#     except:
-#         print("no pretrained optimizer found")
-            
-#     # load schedule
-#     try:
-#         scheduler.load_state_dict(ckpt['schedule'])
-#         print("Schedule load done")
-#     except:
-#         print("no schedule found,")
-    
-#     # load step
-#     try:
-#         init_epoch = ckpt['epoch']
-#         print("Step load done")
-#     except:
-#         init_epoch = 0
-
-#     # Load wandb id
-#     try:
-#         wandb_id = ckpt['wandb_id']
-#         print("wandb id load done")
-#     except:
-#         wandb_id = None
-
-#     try:
-#         ema.ema.load_state_dict(ckpt['ema_state_dict'])
-#         ema.ema.eval()
-#         for p in ema.ema.parameters():
-#             p.requires_grad_(False)
-
-#         print("ema load done")
-#     except:
-#         print('no ema shadow found')
-
-#     return model, optimizer, scheduler, init_epoch, wandb_id, ema
+        return trajectories
