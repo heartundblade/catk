@@ -405,6 +405,10 @@ def inverse_kinematics(
     yaw_rate = wrap_angle(torch.diff(yaw, dim=-1)) / dt
     accel = torch.diff(speed, dim=-1) / dt
     action_valid = agents_future_valid[..., :1] & agents_future_valid[..., 1:]
+
+    # Mask out annotation errors (outliers)
+    action_valid = action_valid & (yaw_rate.abs() < 1.0)   # rad/s, ~29°/s
+    action_valid = action_valid & (accel.abs() < 8.0)       # m/s², ~0.5g
     
     # filter out invalid actions
     yaw_rate = torch.where(action_valid, yaw_rate, 0.0)
@@ -458,13 +462,13 @@ def roll_out(
 
         a = actions[..., 0].repeat_interleave(action_len, dim=-1) 
         v = v.unsqueeze(-1) + torch.cumsum(a * dt, dim=-1)
-        if training:
-            v += torch.randn_like(v) * 0.1
-        v = torch.clamp(v, min=0)
+        # if training:
+        #     v += torch.randn_like(v) * 0.1
+        # v = torch.clamp(v, min=0)
 
         yaw_rate = actions[..., 1].repeat_interleave(action_len, dim=-1) 
-        if training:
-            yaw_rate += torch.randn_like(yaw_rate) * 0.01
+        # if training:
+        #     yaw_rate += torch.randn_like(yaw_rate) * 0.01
 
         # if global_frame:
         theta = theta.unsqueeze(-1) + torch.cumsum(yaw_rate * dt, dim=-1)
@@ -472,7 +476,7 @@ def roll_out(
         #     theta = torch.cumsum(yaw_rate * dt, dim=-1)
 
         # theta = torch.fmod(theta + torch.pi, 2*torch.pi) - torch.pi
-        theta = wrap_angle(theta)
+        # theta = wrap_angle(theta)
         
         v_x = v * torch.cos(theta)
         v_y = v * torch.sin(theta)

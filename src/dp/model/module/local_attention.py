@@ -4,19 +4,22 @@ import torch.nn.functional as F
 
 class MultiheadAttentionLocal(nn.Module):
 
-    def __init__(self, embed_dim, num_heads, dropout=0.0):
+    def __init__(self, embed_dim, num_heads, dropout=0.0, use_key_gate=True):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
         self.scaling = self.head_dim ** -0.5
         self.dropout = dropout
+        self.use_key_gate = use_key_gate
 
         self.in_proj_weight = nn.Parameter(torch.empty(3 * embed_dim, embed_dim))
         self.in_proj_bias = nn.Parameter(torch.empty(3 * embed_dim))
-        self.to_k_proj = nn.Linear(embed_dim, embed_dim)
-        self.to_v_proj = nn.Linear(embed_dim, embed_dim)
         self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+        if use_key_gate:
+            self.key_gate_proj = nn.Linear(self.head_dim, 1)
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -24,10 +27,9 @@ class MultiheadAttentionLocal(nn.Module):
         nn.init.constant_(self.in_proj_bias, 0.0)
         nn.init.xavier_uniform_(self.out_proj.weight)
         nn.init.constant_(self.out_proj.bias, 0.0)
-        nn.init.xavier_uniform_(self.to_k_proj.weight)
-        nn.init.constant_(self.to_k_proj.bias, 0.0)
-        nn.init.xavier_uniform_(self.to_v_proj.weight)
-        nn.init.constant_(self.to_v_proj.bias, 0.0)
+        if self.use_key_gate:
+            nn.init.constant_(self.key_gate_proj.weight, 0.0)
+            nn.init.constant_(self.key_gate_proj.bias, 2.0)
 
     def forward(self, query, key, value, index_pair, 
                 query_batch_cnt=None, key_batch_cnt=None, 
@@ -63,11 +65,11 @@ class MultiheadAttentionLocal(nn.Module):
             query_batch_ids = torch.repeat_interleave(torch.arange(len(query_batch_cnt), device=q.device), query_batch_tensor)
             safe_idx = safe_idx + key_offsets[query_batch_ids][:, None]
 
-        if relation_encodings is not None:
-            if relation_encodings.shape[1] == L:
-                rel_local = relation_encodings
-            else:
-                rel_local = relation_encodings[torch.arange(N, device=q.device)[:, None], safe_idx]
+        # if relation_encodings is not None:
+        #     if relation_encodings.shape[1] == L:
+        #         rel_local = relation_encodings
+        #     else:
+        #         rel_local = relation_encodings[torch.arange(N, device=q.device)[:, None], safe_idx]
         
         # rel_k = self.to_k_proj(rel_local).view(N, L, self.num_heads, self.head_dim)
         # rel_v = self.to_v_proj(rel_local).view(N, L, self.num_heads, self.head_dim)
@@ -108,6 +110,11 @@ class MultiheadAttentionLocal(nn.Module):
         output = torch.einsum('nlh,nlhd->nhd', attn, v_local)
         if rel_v_local is not None:
             output = output + torch.einsum('nlh,nlhd->nhd', attn, rel_v_local)
+
+        if self.use_key_gate:
+            gate = torch.sigmoid(self.key_gate_proj(q))
+            output = output * gate
+
         output = output.reshape(N, self.embed_dim)
         if not skip_out_proj:
             output = self.out_proj(output)

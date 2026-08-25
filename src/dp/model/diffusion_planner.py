@@ -23,7 +23,8 @@ from src.dp.utils.train_utils import (
     inverse_kinematics, 
     batch_transform_trajs_to_local_frame,
     batch_transform_trajs_to_global_frame,
-    roll_out
+    roll_out,
+    wrap_angle,
 )
 from src.dp.model.module.rel_emb import RelationEncoder
 from src.smart.metrics import (
@@ -63,7 +64,7 @@ class Diffusion_Planner(pl.LightningModule):
         self._n_rollout_closed_val = config.get('n_rollout_closed_val', 32)
         self.log_epoch = config.get('log_epoch', -1)
 
-        self._action_len = config.get('action_len', 2)
+        self._action_len = config.get('action_len', 1)
         self._num_actions = self._future_len // self._action_len
         self._pi_loss_weight = config.get('pi_loss_weight', 1.0)
         self.pi_loss = CrossEntropyLoss(reduction='mean')
@@ -148,7 +149,7 @@ class Diffusion_Planner(pl.LightningModule):
             self.log(
                 key, 
                 value,
-                on_step=False, on_epoch=True, sync_dist=True,
+                on_step=True, on_epoch=False, sync_dist=True,
                 prog_bar=True
             )
         
@@ -291,53 +292,53 @@ class Diffusion_Planner(pl.LightningModule):
                     # inputs_normalized = inputs_sdc
 
                     _, decoder_output = self.forward(inputs_normalized)
-                    pred_trajectories = decoder_output["prediction"]  # [B, P, future_len, 4]
+                    pred_actions = decoder_output["prediction"]  # [B, P, num_actions, 2]
                     
-                    # Convert local trajectories to global frame using each agent's current state
-                    pred_trajs_global = batch_transform_trajs_to_global_frame(
-                        pred_trajectories,
-                        current_states_global[..., :4]  # [B, P, 4] - [x, y, cos, sin]
-                    )  # [B, P, future_len, 4]
-                    
-                    # Zero out invalid agents' trajectories
-                    if agents_mask is not None:
-                        pred_trajs_global = pred_trajs_global * agents_mask[..., None, None].float()
-                    
-                    if t == 2:
-                        pred_trajs_sdc = transform_coords_to_sdc_frame(pred_trajs_global, sdc_coord_global)
-                        pred_trajs_3d = torch.cat([
-                            pred_trajs_sdc[..., :2],
-                            torch.zeros_like(pred_trajs_sdc[..., 0:1]),
-                            torch.atan2(pred_trajs_sdc[..., 3:4], pred_trajs_sdc[..., 2:3])
+                    pred_actions = self.action_normalizer.inverse(pred_actions)
+                    pred_trajs_global = roll_out(
+                        current_states_global,  # [B, P, 6]
+                        pred_actions,
+                        dt=0.1,
+                        action_len=self._action_len,
+                        global_frame=True,
+                        valid_mask=agents_mask
+                    )  # [B, P, T, 6] - x, y, cos(theta), sin(theta), v_x, v_y
+
+                    if t == 0:
+                        pred_trajs_local = roll_out(
+                            inputs_sdc['agents_history'][:, :, -1, :6],  # [B, P, 6]
+                            pred_actions,
+                            dt=0.1,
+                            action_len=self._action_len,
+                            global_frame=True,
+                            valid_mask=agents_mask
+                        )
+                        pred_trajs_local_4d = torch.cat([
+                            pred_trajs_local[..., :2],
+                            torch.zeros_like(pred_trajs_local[..., 0:1]),
+                            torch.atan2(pred_trajs_local[..., 3:4], pred_trajs_local[..., 2:3])
                         ], dim=-1)
                         self._log_output(
-                            pred_trajs_3d,
+                            pred_trajs_local_4d,
                             inputs_sdc,
                             batch_idx,
                             trans2global=False,
                             sdc_coord=batch['sdc_coord'],
                         )
 
-                    pred_trajs_step_global = pred_trajs_global[:, :, :step_len, :]  # [B, P, step_len, 4]
-                    trajs.append(pred_trajs_step_global)
+                    pred_trajs_step_global = pred_trajs_global[:, :, :step_len, :]  # [B, P, step_len, 6]
+                    trajs.append(pred_trajs_step_global[..., :4])
                     
-                    # Update SDC position for next step from ego's last predicted position
-                    ego_pred_global = pred_trajs_step_global[:, 0, step_len-1, :]  # [B, 4]
+                    ego_pred_global = pred_trajs_step_global[:, 0, step_len-1, :]  # [B, 6]
                     sdc_coord_global[:, 0] = ego_pred_global[:, 0]  # x
                     sdc_coord_global[:, 1] = ego_pred_global[:, 1]  # y
                     sdc_coord_global[:, 2] = torch.atan2(ego_pred_global[:, 3], ego_pred_global[:, 2])  # theta from cos/sin
                     
                     # Update history in global frame for next step
-                    dt = 0.1
-                    pos_global = torch.cat([current_states_global[:, :, None, :2], pred_trajs_global[..., :2]], dim=-2)  # [B, P, future_len, 2]
-                    v = torch.diff(pos_global, dim=-2) / dt  # [B, P, future_len-1, 2]
-                    v_step = v[:, :, :step_len, :]  # [B, P, step_len, 2]
-                    pred_trajs_step_global_6d = torch.cat([pred_trajs_step_global, v_step], dim=-1)  # [B, P, step_len, 6]
-                    
                     hist_len = batch['agents_history'].shape[2]
                     prev_pred_global = torch.cat(
                         [
-                            prev_pred_global[:, :, -(hist_len-step_len):, :], pred_trajs_step_global_6d
+                            prev_pred_global[:, :, -(hist_len-step_len):, :], pred_trajs_step_global
                         ]
                         , dim=2
                     )  # [B, P, T_hist, 6]
@@ -451,6 +452,9 @@ class Diffusion_Planner(pl.LightningModule):
     def on_after_backward(self):
         total_norm = 0.0
         has_nan_grad = False
+
+        # 按模块分组统计梯度范数
+        module_grad_norms = {}  # {module_name: squared_norm_sum}
         for name, p in self.named_parameters():
             if p.grad is not None:
                 if torch.isnan(p.grad).any():
@@ -458,11 +462,39 @@ class Diffusion_Planner(pl.LightningModule):
                     has_nan_grad = True
                 param_norm = p.grad.data.norm(2)
                 total_norm += param_norm.item() ** 2
+
+                # 提取模块前缀: 取前两级路径 (e.g., "decoder.dit.chunk_blocks.0")
+                parts = name.split('.')
+                if len(parts) >= 3:
+                    module_key = '.'.join(parts[:3])
+                    # 对于 decoder.dit.xxx 的模块，进一步细化到 block 级别
+                    if parts[0] == 'decoder' and parts[1] == 'dit' and parts[2] in ('chunk_blocks', 'refiner_blocks'):
+                        if len(parts) >= 4:
+                            module_key = '.'.join(parts[:4])
+                else:
+                    module_key = '.'.join(parts[:2]) if len(parts) >= 2 else parts[0]
+
+                module_grad_norms[module_key] = module_grad_norms.get(module_key, 0.0) + param_norm.item() ** 2
+
         total_norm = total_norm ** 0.5
         if has_nan_grad:
             print(f"[NaN GRAD] step {self.global_step}: gradient_norm={total_norm}")
-        
+
         self.log("grad/global_norm_raw", total_norm, on_step=True, on_epoch=True, prog_bar=False)
+
+        # 按 epoch 累积各模块的梯度范数平方和（只记 epoch 级，避免日志量过大）
+        if not hasattr(self, '_epoch_module_grad_norms'):
+            self._epoch_module_grad_norms = {}
+
+        for mod_name, sq_norm in module_grad_norms.items():
+            self._epoch_module_grad_norms[mod_name] = \
+                self._epoch_module_grad_norms.get(mod_name, 0.0) + sq_norm
+
+        if not hasattr(self, '_epoch_grad_count'):
+            self._epoch_grad_count = 0
+        self._epoch_grad_count += 1
+
+        self._pre_clip_norm = total_norm
     
     def on_before_optimizer_step(self, optimizer):
             # Check for NaN in parameters before optimizer step
@@ -481,7 +513,39 @@ class Diffusion_Planner(pl.LightningModule):
             is_clipped = 1.0 if global_norm >= (clip_threshold - 1e-4) else 0.0
             
             self.log("grad/clipping_ratio", is_clipped, on_step=False, on_epoch=True)
-            # self.log("grad/global_norm", global_norm, on_step=False, on_epoch=True)
+            self.log("grad/global_norm", global_norm, on_step=True, on_epoch=True, prog_bar=False)
+
+            if hasattr(self, '_pre_clip_norm') and self._pre_clip_norm > 0:
+                clip_factor = global_norm / self._pre_clip_norm
+                self.log("grad/clip_factor", clip_factor, on_step=True, on_epoch=True, prog_bar=False)
+
+    def on_train_epoch_end(self):
+        """Epoch 结束时输出各模块累积梯度范数，避免 step 级日志量过大。"""
+        if not hasattr(self, '_epoch_module_grad_norms') or self._epoch_grad_count == 0:
+            return
+
+        count = self._epoch_grad_count
+        module_avg_norms = {k: (v / count) ** 0.5 for k, v in self._epoch_module_grad_norms.items()}
+
+        top_n = 8
+        sorted_modules = sorted(module_avg_norms.items(), key=lambda x: x[1], reverse=True)
+        for rank, (mod_name, avg_norm) in enumerate(sorted_modules[:top_n]):
+            short_name = mod_name.replace('decoder.dit.', 'd.').replace('encoder.', 'e.')
+            self.log(f"grad/mod/{short_name}", avg_norm, on_step=False, on_epoch=True, prog_bar=False)
+
+        # enc_norm = sum(
+        #     v for k, v in self._epoch_module_grad_norms.items() if k.startswith('encoder')
+        # ) ** 0.5 / (count ** 0.5)
+        # dec_norm = sum(
+        #     v for k, v in self._epoch_module_grad_norms.items() if k.startswith('decoder')
+        # ) ** 0.5 / (count ** 0.5)
+        # total = enc_norm + dec_norm
+        # if total > 0:
+        #     self.log("grad/enc_ratio", enc_norm / total, on_step=False, on_epoch=True, prog_bar=False)
+        #     self.log("grad/dec_ratio", dec_norm / total, on_step=False, on_epoch=True, prog_bar=False)
+
+        self._epoch_module_grad_norms.clear()
+        self._epoch_grad_count = 0
     
     def diffusion_loss_func(
         self,
@@ -510,171 +574,148 @@ class Diffusion_Planner(pl.LightningModule):
         # Get ground truth future states [B, P, T, 3] - x, y, yaw (from cos and sin)
         gt_future_pos = agents_future[..., 1:, :2].clone()  # [B, P, T, 2] - x, y
         gt_future_yaw = torch.atan2(agents_future[..., 1:, 3], agents_future[..., 1:, 2])  # [B, P, T]
-        
+        # future_mask = agents_future_valid[..., 1:].clone()  # [B, P, T]
         future_mask = agents_future_valid[..., 1:]*(agents_interested[..., None]>0)  # [B, P, T]
+
+        # Calculate GT actions using inverse kinematics
+        gt_actions, gt_actions_valid = inverse_kinematics(
+            agents_future,
+            agents_future_valid,
+            dt=0.1,
+            action_len=self._action_len,
+        )  # gt_actions: [B, P, num_actions, 2], gt_actions_valid: [B, P, num_actions]
 
         if self.training:
             t = torch.rand(B, device=agents_future.device) * (1 - eps) + eps # [B,]
+            z = torch.randn_like(gt_actions, device=agents_future.device) # [B, P, num_actions, 2]
+
+            # # for debug
+            # t = torch.full_like(t, eps)
+            # z = torch.zeros_like(z)
+
+            gt_actions_norm = norm(gt_actions)
             
-            # Direct trajectory prediction: add noise to GT trajectory [x, y, cos, sin]
-            gt_trajs_global = agents_future[..., :, :4]  # [B, P, T, 4] - x, y, cos, sin (global frame)
-            gt_trajs = batch_transform_trajs_to_local_frame(
-                gt_trajs_global, ref_idx=0
-            )[:, :, 1:, :]  # [B, P, T, 4] - GT in local frame
-            
-            z = torch.randn_like(gt_trajs, device=agents_future.device) # [B, P, T, 4]
-            
-            mean, std = marginal_prob(self.state_normalizer(gt_trajs), t)
-            std = std.view(-1, *([1] * (len(gt_trajs.shape)-1)))
+            mean, std = marginal_prob(gt_actions_norm, t)
+            std = std.view(-1, *([1] * (len(gt_actions_norm.shape)-1)))
 
             xT = mean + std * z
             
             merged_inputs = {
                 **inputs_norm,
                 # **inputs,
-                "sampled_trajectories": xT,
+                "sampled_actions": xT,
                 "diffusion_time": t,
                 # "current_states": current_states,  # Pass current states for potential use
             }
 
-            _, decoder_output = self.forward(merged_inputs)
-            score = decoder_output["score"]  # [B, P, T, 4]
-            
-            gt_trajs_norm = self.state_normalizer(gt_trajs)  # [B, P, T, 4]
-            
-            # Direct single-modal regression loss
-            state_loss = mse_loss(score, gt_trajs_norm, reduction='none').sum(-1)  # [B, P, T]
-            loss = state_loss * future_mask
+            encoder_outputs, decoder_output = self.forward(merged_inputs)
+            pred_actions = decoder_output["score"]  # [B, P, num_actions, 2]
+            pred_actions_norm = decoder_output["score"].clone()
 
-            pred_trajectories = self.state_normalizer.inverse(score)  # [B, P, T, 4]
+            pred_actions = norm.inverse(pred_actions)
+            pred_trajectories = roll_out(
+                current_states.squeeze(2),  # [B, P, 6]
+                pred_actions,
+                dt=0.1,
+                action_len=self._action_len,
+                global_frame=True,
+                training=True
+            )  # [B, P, T, 5]
+            
             decoder_output["predicted_trajectories"] = pred_trajectories
-            ref_state = current_states[..., :4]  # [B, P, 1, 4]
+
+            state_loss = mse_loss(pred_trajectories[..., :2], gt_future_pos, reduction='none').sum(-1)  # [B, P, T]
             
-            loss_dict["train/state_loss"] = (state_loss * future_mask).sum() / future_mask.sum()
+            pred_yaw = torch.atan2(pred_trajectories[..., 3], pred_trajectories[..., 2])  # [B, P, T]
+            yaw_error = pred_yaw - gt_future_yaw  # [B, P, T]
+            yaw_error = torch.atan2(torch.sin(yaw_error), torch.cos(yaw_error))
+            yaw_loss = yaw_error ** 2  # [B, P, T], MSE
             
-            denoise_mse = torch.norm(pred_trajectories[..., :2] - gt_trajs[..., :2], dim=-1)
+            # weight = 1.0 / (std.view(-1) ** 2 + 1e-4)
+            # weight = weight / weight.mean()
+            # action_loss = action_loss * weight.view(B, 1, 1)
+
+            accel_loss = smooth_l1_loss(pred_actions_norm[..., 0], gt_actions_norm[..., 0], reduction='none') * gt_actions_valid  # [B, P, num_actions]
+            yaw_rate_loss = smooth_l1_loss(pred_actions_norm[..., 1], gt_actions_norm[..., 1], reduction='none') * gt_actions_valid  # [B, P, num_actions]
+            valid_count = gt_actions_valid.sum()
+
+            loss_dict["train/accel_loss"] = accel_loss.sum() / valid_count
+            loss_dict["train/yaw_rate_loss"] = yaw_rate_loss.sum() / valid_count
+            loss_dict["train/action_loss"] = (accel_loss.sum() + yaw_rate_loss.sum()) / valid_count
+
+            masked_loss = (state_loss + yaw_loss) * future_mask[:, :self._predicted_neighbor_num+1, :]
+            loss = 0.1 * masked_loss.sum() / future_mask[:, :self._predicted_neighbor_num+1, :].sum() + (accel_loss.sum() + yaw_rate_loss.sum()) / valid_count
+            # loss = (accel_loss.sum() + yaw_rate_loss.sum()) / valid_count
+
+            # Calculate ADE and FDE metrics
+            denoise_mse = torch.norm(pred_trajectories[..., :2] - gt_future_pos, dim=-1)
             denoise_ADE = denoise_mse[future_mask.bool()].mean()
             denoise_FDE = denoise_mse[..., -1][future_mask[..., -1].bool()].mean()
             loss_dict["train/denoise_ADE"] = denoise_ADE
             loss_dict["train/denoise_FDE"] = denoise_FDE
 
-            # Diffusion loss: directly supervise x_0 prediction in trajectory space
-            # diffusion_loss = mse_loss(pred_trajectories, gt_trajs, reduction='none').sum(-1)  # [B, P, T]
-            # diffusion_loss = (diffusion_loss * future_mask).sum() / future_mask.sum()
+            # Diffusion loss: directly supervise x_0 prediction in action space
+            # diffusion_loss = mse_loss(pred_actions_norm, gt_actions_norm, reduction='none').sum(-1)  # [B, P, num_actions]
+            # diffusion_loss = (diffusion_loss * gt_actions_valid).sum() / gt_actions_valid.sum()
             # loss_dict["train/diffusion_loss"] = diffusion_loss.item()
         else:
             _, decoder_output = self.forward(inputs_norm)
-            pred_trajectories = decoder_output["prediction"]  # [B, P, future_len, 4]
+            # _, decoder_output = self.forward(inputs)
+            pred_actions = decoder_output["prediction"]  # [B, P, num_actions, 2]
             
-            P_val = self._predicted_neighbor_num + 1
-            pred_trajectories = pred_trajectories[:, :P_val]  # [B, P', future_len, 4]
-
-            gt_trajs_global = agents_future[:, :P_val, :, :4]
-            gt_trajs = batch_transform_trajs_to_local_frame(
-                gt_trajs_global, ref_idx=0
-            )[:, :, 1:, :]  # [B, P', future_len, 4] - GT in local frame
-
+            pred_actions = norm.inverse(pred_actions)
+            # No mask since mask is applied in loss calculation
+            pred_trajectories = roll_out(
+                current_states[:, :self._predicted_neighbor_num+1, -1, :],  # [B, P, 6]
+                pred_actions,
+                dt=0.1,
+                action_len=self._action_len,
+                global_frame=True,
+                training=False
+            )  # [B, P, T, 5]
+            
             decoder_output["predicted_trajectories"] = pred_trajectories
-
-            state_loss = mse_loss(pred_trajectories, gt_trajs, reduction='none').sum(-1)  # [B, P', future_len]
-
-            loss_dict["val/state_loss"] = (state_loss * future_mask[:, :P_val, :]).sum() / future_mask[:, :P_val, :].sum()
             
-            denoise_mse = torch.norm(pred_trajectories[..., :2] - gt_trajs[..., :2], dim=-1)
-            denoise_ADE = denoise_mse[future_mask[:, :P_val, :].bool()].mean()
-            denoise_FDE = denoise_mse[..., -1][future_mask[:, :P_val, -1].bool()].mean()
+            state_loss = smooth_l1_loss(pred_trajectories[..., :2], gt_future_pos[:, :self._predicted_neighbor_num+1, :, :2], reduction='none').sum(-1)  # [B, P, T]
+            
+            pred_yaw = torch.atan2(pred_trajectories[..., 3], pred_trajectories[..., 2])
+            yaw_error = pred_yaw - gt_future_yaw[:, :self._predicted_neighbor_num+1, :]  # [B, P, T]
+            yaw_error = torch.atan2(torch.sin(yaw_error), torch.cos(yaw_error))
+            yaw_loss = yaw_error ** 2  # [B, P, T], MSE
+
+            # loss_dict["val/state_loss"] = (state_loss * future_mask[:, :self._predicted_neighbor_num+1, :]).sum() / future_mask[:, :self._predicted_neighbor_num+1, :].sum()
+            # loss_dict["val/yaw_loss"] = (yaw_loss * future_mask[:, :self._predicted_neighbor_num+1, :]).sum() / future_mask[:, :self._predicted_neighbor_num+1, :].sum()
+            
+            action_loss = mse_loss(pred_actions, gt_actions[:, :self._predicted_neighbor_num+1, :, :], reduction='none').sum(-1)  # [B, P, num_actions]
+            action_loss = action_loss * gt_actions_valid[:, :self._predicted_neighbor_num+1, :]  # [B, P, num_actions]
+            loss_dict["val/action_loss"] = (action_loss[:, :self._predicted_neighbor_num+1, :]).sum() / gt_actions_valid[:, :self._predicted_neighbor_num+1, :].sum()
+
+            # Calculate ADE and FDE metrics
+            denoise_mse = torch.norm(pred_trajectories[..., :2] - gt_future_pos[:, :self._predicted_neighbor_num+1, :, :2], dim=-1)
+            denoise_ADE = denoise_mse[future_mask[:, :self._predicted_neighbor_num+1, :].bool()].mean()
+            denoise_FDE = denoise_mse[..., -1][future_mask[:, :self._predicted_neighbor_num+1, -1].bool()].mean()
             loss_dict["val/denoise_ADE"] = denoise_ADE
             loss_dict["val/denoise_FDE"] = denoise_FDE
             
-            loss = state_loss * future_mask[:, :P_val, :]
+            masked_loss = (state_loss + yaw_loss) * future_mask[:, :self._predicted_neighbor_num+1, :]
+            loss = masked_loss.sum() / future_mask[:, :self._predicted_neighbor_num+1, :].sum()
+            # loss = action_loss.sum() / gt_actions_valid.sum()
         
-        # ############### Behavior Prior Prediction #################
-        # if self.training and self._train_predictor and self.predictor is not None:
-        #     # Get anchors from inputs
-        #     anchors = inputs.get("anchors", None)
-        #     if anchors is not None:
-        #         goal_actions, goal_scores = self.predictor(encoder_outputs, anchors)
-                
-        #         # Roll out predicted actions to get trajectories
-        #         goal_trajs = roll_out(
-        #             current_states.squeeze(2)[:, :self.predictor._agents_len],  # [B, P, 6]
-        #             goal_actions.flatten(2, 3),  # [B, P*Q, num_actions, 2]
-        #             dt=0.1,
-        #             action_len=self._action_len,
-        #             global_frame=True,
-        #             training=True
-        #         )  # [B, P*Q, T, 6]
-                
-        #         # Reshape back to [B, P, Q, T, 6]
-        #         goal_trajs = goal_trajs.view(B, self.predictor._agents_len, -1, self._future_len, 6)
-                
-        #         # Calculate goal loss (similar to VBD)
-        #         # Get ground truth future
-        #         gt_future = agents_future[:, :self.predictor._agents_len, 1:, :4]  # [B, P, T, 4]
-        #         gt_future_valid = agents_future_valid[:, :self.predictor._agents_len, 1:]  # [B, P, T]
-        #         agents_interest = agents_interested[:, :self.predictor._agents_len]  # [B, P]
-                
-        #         # Find closest anchor to ground truth end point
-        #         goal_gt = agents_future[:, :self.predictor._agents_len, -1:, :2]  # [B, P, 1, 2]
-        #         # anchors_global = transform_coords_to_global_frame(
-        #         #     anchors[:, :self.predictor._agents_len], 
-        #         #     inputs['sdc_coord']
-        #         # )  # [B, P, Q, 2]
-                
-        #         # Find closest anchor
-        #         dist_to_goal = torch.norm(anchors[:, :self.predictor._agents_len] - goal_gt, dim=-1)  # [B, P, Q]
-        #         idx_anchor = torch.argmin(dist_to_goal, dim=-1)  # [B, P]
-                
-        #         # Find trajectory with min ADE
-        #         trajs_pred = goal_trajs[..., :4]  # [B, P, Q, T, 4]
-        #         dist = torch.norm(trajs_pred - gt_future[:, :, None, :, :], dim=-1)  # [B, P, Q, T]
-        #         dist = dist * gt_future_valid[:, :, None, :]  # [B, P, Q, T]
-        #         idx_min_ade = torch.argmin(dist.mean(-1), dim=-1)  # [B, P]
-                
-        #         # Select based on whether end point is valid
-        #         idx = torch.where(
-        #             agents_future_valid[:, :self.predictor._agents_len, -1], 
-        #             idx_anchor, 
-        #             idx_min_ade
-        #         )  # [B, P]
-                
-        #         # Select the best trajectory for each agent
-        #         batch_idx = torch.arange(B)[:, None].expand(B, self.predictor._agents_len).flatten()
-        #         agent_idx = torch.arange(self.predictor._agents_len)[None, :].expand(B, self.predictor._agents_len).flatten()
-        #         selected_trajs = goal_trajs[batch_idx, agent_idx, idx.flatten()]  # [B*P, T, 5]
-                
-        #         # Calculate trajectory loss
-        #         traj_loss = smooth_l1_loss(selected_trajs[..., :4], gt_future.flatten(0, 1), reduction='none').sum(-1)  # [B*P, T]
-        #         traj_mask = gt_future_valid.flatten(0, 1) * (agents_interest.flatten(0, 1) > 0).unsqueeze(-1)  # [B*P, T]
-        #         traj_loss = traj_loss * traj_mask  # [B*P, T]
-        #         goal_loss_mean = traj_loss.sum() / traj_mask.sum()
-                
-        #         # Calculate score loss (cross entropy)
-        #         scores = goal_scores.flatten(0, 1)  # [B*P, Q]
-        #         score_loss = cross_entropy(scores, idx.flatten(), reduction='none')  # [B*P]
-        #         score_loss = score_loss * (agents_interest.flatten(0, 1) > 0)  # [B*P]
-        #         score_loss_mean = score_loss.sum() / (agents_interest > 0).sum()
-                
-        #         # Combine losses
-        #         pred_loss = goal_loss_mean + 0.05 * score_loss_mean
-                
-        #         # Add to total loss
-        #         total_loss = loss.sum() / future_mask.sum() + pred_loss
-                
-        #         loss_dict["val/goal_loss"] = goal_loss_mean.item()
-        #         loss_dict["val/score_loss"] = score_loss_mean.item()
-        #         loss_dict["val/pred_loss"] = pred_loss.item()
-        #     else:
-        #         total_loss = loss.sum() / future_mask.sum()
+        # neighbor_mask = future_mask[:, 1:self._predicted_neighbor_num+1, :]
+        # neighbor_loss = loss[:, 1:self._predicted_neighbor_num+1, :]
+        # masked_prediction_loss = neighbor_loss[neighbor_mask]
+
+        # if masked_prediction_loss.numel() > 0:
+        #     loss_dict["neighbor_prediction_loss"] = masked_prediction_loss.mean()
         # else:
-        #     total_loss = loss.sum() / future_mask[:, :self._predicted_neighbor_num+1, :].sum()
+        #     loss_dict["neighbor_prediction_loss"] = torch.tensor(0.0, device=masked_prediction_loss.device)
+
+        # loss_dict["ego_planning_loss"] = loss[:, 0, :][future_mask[:, 0, :]].mean()
 
         if self.training:
-            total_loss = loss.sum() / future_mask.sum()
-            assert not torch.isnan(total_loss).any(), f"loss cannot be nan"
-        else:
-            total_loss = loss.sum() / future_mask[:, :P_val, :].sum()
-        return total_loss, loss_dict, decoder_output
+            assert not torch.isnan(loss).sum(), f"loss cannot be nan"
+
+        return loss, loss_dict, decoder_output
     
     def _log_output(
             self, 
@@ -765,9 +806,9 @@ class Diffusion_Planner_Encoder(nn.Module):
         # Initialize embedding MLP:
         # nn.init.normal_(self.encoder.pos_emb.weight, std=0.02)
         nn.init.normal_(self.encoder.agents_encoder.type_emb.weight, std=0.02)
-        nn.init.normal_(self.encoder.lane_encoder.speed_limit_emb.weight, std=0.02)
+        # nn.init.normal_(self.encoder.lane_encoder.speed_limit_emb.weight, std=0.02)
         nn.init.normal_(self.encoder.lane_encoder.traffic_emb.weight, std=0.02)
-        nn.init.normal_(self.encoder.traffic_light_encoder.type_embed.weight, std=0.02)
+        # nn.init.normal_(self.encoder.traffic_light_encoder.type_embed.weight, std=0.02)
 
     def forward(self, inputs):
 
@@ -803,15 +844,18 @@ class Diffusion_Planner_Decoder(nn.Module):
         nn.init.normal_(self.decoder.dit.t_embedder.mlp[2].weight, std=0.02)
 
         # Zero-out adaLN modulation layers in DiT blocks:
-        for block in self.decoder.dit.blocks:
+        nn.init.constant_(self.decoder.dit.t_action_modulation[-1].weight, 0)
+        nn.init.constant_(self.decoder.dit.t_action_modulation[-1].bias, 0)
+        for block in self.decoder.dit.chunk_blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
         # Zero-out output layers:
-        nn.init.constant_(self.decoder.dit.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.decoder.dit.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.decoder.dit.final_layer.proj[-1].weight, 0)
-        nn.init.constant_(self.decoder.dit.final_layer.proj[-1].bias, 0)
+        # nn.init.constant_(self.decoder.dit.final_layer.adaLN_modulation[-1].weight, 0)
+        # nn.init.constant_(self.decoder.dit.final_layer.adaLN_modulation[-1].bias, 0)
+        for head in self.decoder.dit.final_layer.heads:
+            nn.init.constant_(head[-1].weight, 0)
+            nn.init.constant_(head[-1].bias, 0)
 
     def forward(self, encoder_outputs, inputs):
 

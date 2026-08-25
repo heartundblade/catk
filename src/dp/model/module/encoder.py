@@ -16,14 +16,19 @@ class Encoder(nn.Module):
 
         self.hidden_dim = config.hidden_dim
 
-        self.token_num = config.agent_num + config.static_map_num + config.lane_num + config.roadline_num + config.traffic_light_num
+        self.token_num = config.agent_num + config.static_map_num + config.lane_num + config.roadline_num  # + config.traffic_light_num
         self.local_attn_k = getattr(config, 'local_attn_k', 16)
 
-        self.agents_encoder = AgentFusionEncoder(config.time_len, drop_path_rate=config.encoder_drop_path_rate, hidden_dim=config.hidden_dim, depth=config.encoder_depth)
+        # self.agents_encoder = AgentFusionEncoder(config.time_len, drop_path_rate=config.encoder_drop_path_rate, hidden_dim=config.hidden_dim, depth=config.encoder_depth)
+        self.agents_encoder = AgentEncoder(
+            config.time_len, 
+            drop_path_rate=config.encoder_drop_path_rate, 
+            hidden_dim=config.hidden_dim, 
+            depth_self=config.encoder_depth, 
+            depth_cross=1,
+            num_heads=config.num_heads
+        )
 
-        # Create shared backbone for static_maps, lanes and roadlines
-        # This shares the position encoding matrix (channel_pre_project),
-        # all MixerBlocks, and the final projection layer among the three encoders
         self.vector_map_backbone = VectorMapBackbone(
             channels_mlp_dim=128,
             tokens_mlp_dim=64,
@@ -50,21 +55,43 @@ class Encoder(nn.Module):
             shared_backbone=self.vector_map_backbone
         )
 
-        self.traffic_light_encoder = TrafficLightEncoder(config.hidden_dim)
+        # self.traffic_light_encoder = TrafficLightEncoder(config.hidden_dim)
 
         self.rel_encoder = rel_encoder if rel_encoder is not None else RelationEncoder(
             hidden_dim=config.hidden_dim,
             num_freq_bands=64
         )
 
-        self.fusion = FusionEncoder(
+        self.fusion_m2m = FusionEncoder(
             hidden_dim=config.hidden_dim, 
             num_heads=config.num_heads, 
             drop_path_rate=config.encoder_drop_path_rate, 
-            depth=config.encoder_depth, 
+            depth=1, 
             device=config.device,
             rel_encoder=self.rel_encoder,
         )
+
+        self.fusion_layers = nn.ModuleList([
+            nn.ModuleDict({
+                'a2m': CrossFusionEncoder(
+                    hidden_dim=config.hidden_dim,
+                    num_heads=config.num_heads,
+                    drop_path_rate=config.encoder_drop_path_rate,
+                    depth=1,
+                    device=config.device,
+                    rel_encoder=self.rel_encoder,
+                ),
+                'a2a': FusionEncoder(
+                    hidden_dim=config.hidden_dim,
+                    num_heads=config.num_heads,
+                    drop_path_rate=config.encoder_drop_path_rate,
+                    depth=1,
+                    device=config.device,
+                    rel_encoder=self.rel_encoder,
+                ),
+            })
+            for _ in range(config.encoder_depth)
+        ])
 
     def forward(self, inputs):
 
@@ -83,20 +110,20 @@ class Encoder(nn.Module):
 
         B = agents.shape[0]
 
-        agents_pos = agents[:, :, -1, :8].clone()
-        agents_pos[..., -4:] = 0.0
-        agents_pos[..., -4] = 1.0
+        # agents_pos = agents[:, :, -1, :8].clone()
+        # agents_pos[..., -4:] = 0.0
+        # agents_pos[..., -4] = 1.0
 
         agents_local = batch_transform_trajs_to_local_frame(agents)
 
         encoding_agents, agents_mask, _ = self.agents_encoder(agents_local, agents_type)
-        static_map_len = self.static_map_encoder._map_len
-        lane_len = self.lane_encoder._lane_len
-        roadline_len = self.roadline_encoder._roadline_len
 
-        static_spatial_pos = static_maps[:, :, int(static_map_len / 2), :4].clone()
-        lane_spatial_pos = lanes[:, :, int(lane_len / 2), :4].clone()
-        roadline_spatial_pos = roadlines[:, :, int(roadline_len / 2), :4].clone()
+        # static_map_len = self.static_map_encoder._map_len
+        # lane_len = self.lane_encoder._lane_len
+        # roadline_len = self.roadline_encoder._roadline_len
+        # static_spatial_pos = static_maps[:, :, int(static_map_len / 2), :4].clone()
+        # lane_spatial_pos = lanes[:, :, int(lane_len / 2), :4].clone()
+        # roadline_spatial_pos = roadlines[:, :, int(roadline_len / 2), :4].clone()
 
         static_maps_local = batch_transform_maps_to_local_frame(static_maps)
         lanes_local = batch_transform_maps_to_local_frame(lanes)
@@ -106,27 +133,26 @@ class Encoder(nn.Module):
         encoding_lanes, lanes_mask, lane_pos = self.lane_encoder(lanes_local, lanes_speed_limit, lanes_has_speed_limit)
         encoding_roadlines, roadlines_mask, roadline_pos = self.roadline_encoder(roadlines_local)
 
-        # traffic lights
-        traffic_lights = inputs['traffic_light_points']
-        encoding_traffic_lights, traffic_lights_mask = self.traffic_light_encoder(traffic_lights)
+        # # traffic lights
+        # traffic_lights = inputs['traffic_light_points']
+        # encoding_traffic_lights, traffic_lights_mask = self.traffic_light_encoder(traffic_lights)
 
-        static_pos[..., :4] = static_spatial_pos
-        lane_pos[..., :4] = lane_spatial_pos
-        roadline_pos[..., :4] = roadline_spatial_pos
+        # static_pos[..., :4] = static_spatial_pos
+        # lane_pos[..., :4] = lane_spatial_pos
+        # roadline_pos[..., :4] = roadline_spatial_pos
 
-        encoding_input = torch.cat([encoding_agents, encoding_static, encoding_lanes, encoding_roadlines, encoding_traffic_lights], dim=1)
+        encoding_input = torch.cat([encoding_agents, encoding_static, encoding_lanes, encoding_roadlines], dim=1)  # , encoding_traffic_lights
 
         # encoding_pos = torch.cat([agents_pos, static_pos, lane_pos, roadline_pos], dim=1).view(B * self.token_num, -1)
-        encoding_mask = torch.cat([agents_mask, static_mask, lanes_mask, roadlines_mask, traffic_lights_mask], dim=1).view(-1)
+        encoding_mask = torch.cat([agents_mask, static_mask, lanes_mask, roadlines_mask], dim=1).view(-1)  # , traffic_lights_mask
         # encoding_pos = self.pos_emb(encoding_pos[~encoding_mask])
         # encoding_pos_result = torch.zeros((B * self.token_num, self.hidden_dim), device=encoding_pos.device)
         # encoding_pos_result[~encoding_mask] = encoding_pos  # Fill in valid parts
 
         # encoding_input = encoding_input + encoding_pos_result.view(B, self.token_num, -1)
 
-        # Compute and encode relations
         relations, all_elements = batch_calculate_relations(
-            agents, static_maps, lanes, roadlines, traffic_lights,
+            agents, static_maps, lanes, roadlines,  # traffic_lights,
             encoding_mask=encoding_mask.reshape(B, self.token_num),
             device=agents.device
         )
@@ -136,14 +162,62 @@ class Encoder(nn.Module):
         # encoded_angle = self.relation_angle_encoder(relations_angle)
         encoder_outputs['relations'] = relations
 
-        N = self.token_num
-        dist = torch.norm(relations[..., :2], dim=-1)
-        dist = dist + torch.eye(N, device=dist.device).unsqueeze(0) * 1e9
-        mask_2d = encoding_mask.view(B, N)
-        dist = dist.masked_fill(mask_2d.unsqueeze(1), 1e9)
-        _, index_pair = torch.topk(dist, k=self.local_attn_k, dim=-1, largest=False)
-        index_pair = index_pair.reshape(B * N, self.local_attn_k)
+        n_agents = encoding_agents.shape[1]
+        n_static = encoding_static.shape[1]
+        n_lanes = encoding_lanes.shape[1]
+        n_roadlines = encoding_roadlines.shape[1]
+        # n_tls = encoding_traffic_lights.shape[1]
+        
 
+        map_start = n_agents
+        map_end = n_agents + n_static + n_lanes + n_roadlines  # + n_tls
+        N_map = map_end - map_start
+
+        encoding_map = encoding_input[:, map_start:map_end, :]
+        encoding_map_mask = encoding_mask.view(B, -1)[:, map_start:map_end]
+        relations_map = relations[:, map_start:map_end, :, :][:, :, map_start:map_end]
+
+        dist_map = torch.norm(relations_map[..., :2], dim=-1)
+        mask_map_2d = encoding_map_mask
+        dist_map = dist_map.masked_fill(mask_map_2d.unsqueeze(1), 1e9)
+        _, index_pair_map = torch.topk(dist_map, k=self.local_attn_k, dim=-1, largest=False)
+        index_pair_map = index_pair_map.reshape(B * N_map, self.local_attn_k)
+
+        encoding_map_fused = self.fusion_m2m(encoding_map, encoding_map_mask, index_pair_map, relations_map)
+
+        encoding_agents_mask = encoding_mask.view(B, -1)[:, :n_agents]
+        relations_a2m = relations[:, :n_agents, :, :][:, :, map_start:map_end]
+
+        dist_a2m = torch.norm(relations_a2m[..., :2], dim=-1)
+        dist_a2m = dist_a2m.masked_fill(encoding_agents_mask.unsqueeze(-1), 1e9)
+        dist_a2m = dist_a2m.masked_fill(encoding_map_mask.unsqueeze(1), 1e9)
+        _, index_pair_a2m = torch.topk(dist_a2m, k=32, dim=-1, largest=False)
+        index_pair_a2m = index_pair_a2m.reshape(B * n_agents, 32)
+
+        relations_agent = relations[:, :n_agents, :, :][:, :, :n_agents]
+
+        dist_agent = torch.norm(relations_agent[..., :2], dim=-1)
+        dist_agent = dist_agent.masked_fill(encoding_agents_mask.unsqueeze(1), 1e9)
+        _, index_pair_agent = torch.topk(dist_agent, k=self.local_attn_k, dim=-1, largest=False)
+        index_pair_agent = index_pair_agent.reshape(B * n_agents, self.local_attn_k)
+
+        for layer in self.fusion_layers:
+            encoding_agents = layer['a2m'](
+                encoding_agents, encoding_map_fused,
+                encoding_agents_mask, encoding_map_mask,
+                index_pair_a2m, relations_a2m
+            )
+            encoding_agents = layer['a2a'](
+                encoding_agents, encoding_agents_mask, index_pair_agent, relations_agent
+            )
+
+
+        encoding_fused = torch.cat([
+            encoding_agents,
+            encoding_map_fused,
+            # encoding_input[:, map_end:, :],
+        ], dim=1)
+        
         # # ---- DEBUG: 保存 index_pair 数据到文件，确认后删除 ----
         # debug_index_pair(index_pair, all_elements, encoding_mask, B, N, self.local_attn_k,
         #                  n_agents=64, n_static=20,
@@ -151,8 +225,9 @@ class Encoder(nn.Module):
         #                  n_traffic_lights=20)
         # # ---- DEBUG END ----
 
-        encoder_outputs['encoding'] = self.fusion(encoding_input, encoding_mask.view(B, N), index_pair, relations)
-        encoder_outputs['encoding_mask'] = encoding_mask.view(B, N)
+        encoder_outputs['encoding'] = encoding_fused
+        # encoder_outputs['encoding'] = encoding_input
+        encoder_outputs['encoding_mask'] = encoding_mask.view(B, -1)
 
         return encoder_outputs
 
@@ -246,39 +321,51 @@ class VectorMapBackbone(nn.Module):
             in_features=4, hidden_features=channels_mlp_dim,
             out_features=channels_mlp_dim, act_layer=nn.GELU, drop=0.
         )
-        self.blocks = nn.ModuleList([
-            MixerBlock(tokens_mlp_dim, channels_mlp_dim, drop_path_rate)
-            for _ in range(depth)
-        ])
+        # self.blocks = nn.ModuleList([
+        #     MixerBlock(tokens_mlp_dim, channels_mlp_dim, drop_path_rate)
+        #     for _ in range(depth)
+        # ])
+        self.point_mlp = nn.Sequential(
+            nn.LayerNorm(channels_mlp_dim),
+            Mlp(in_features=channels_mlp_dim, hidden_features=channels_mlp_dim * 4,
+                out_features=channels_mlp_dim, act_layer=nn.GELU, drop=drop_path_rate),
+        )
         self.norm = nn.LayerNorm(channels_mlp_dim)
         self.emb_project = Mlp(
             in_features=channels_mlp_dim, hidden_features=hidden_dim,
             out_features=hidden_dim, act_layer=nn.GELU, drop=drop_path_rate
         )
 
-        self.global_fusion = nn.Sequential(
-            nn.Linear(channels_mlp_dim * 2, channels_mlp_dim),
-            nn.LayerNorm(channels_mlp_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(channels_mlp_dim, channels_mlp_dim),
+        self.query_token = nn.Parameter(torch.randn(1, 1, channels_mlp_dim) * 0.02)
+        self.attn_pool = nn.MultiheadAttention(
+            embed_dim=channels_mlp_dim, num_heads=4, dropout=drop_path_rate, batch_first=True
         )
+        self.attn_norm = nn.LayerNorm(channels_mlp_dim)
 
     def mix(self, x):
         """
-        MixerBlocks + mean pooling.
+        MixerBlocks + attention pooling.
         Args:
             x: [N, V, channels_mlp_dim]  after channel_pre_project + token_pre_project
         Returns:
             x: [N, channels_mlp_dim]
         """
-        for block in self.blocks:
-            x = block(x)
-        
-        global_feat = torch.max(x, dim=1, keepdim=True)[0]
-        x = torch.cat([x, global_feat.expand(-1, x.shape[1], -1)], dim=-1)
-        x = self.global_fusion(x)
-        x = torch.max(x, dim=1)[0]
+        x = self.point_mlp(x)
+
+        N = x.shape[0]
+        q = self.query_token.expand(N, -1, -1)
+        x, _ = self.attn_pool(q, x, x)
+        x = self.attn_norm(x.squeeze(1))
         return x
+    
+        # for block in self.blocks:
+        #     x = block(x)
+        
+        # global_feat = torch.max(x, dim=1, keepdim=True)[0]
+        # x = torch.cat([x, global_feat.expand(-1, x.shape[1], -1)], dim=-1)
+        # x = self.global_fusion(x)
+        # x = torch.max(x, dim=1)[0]
+        # return x
 
     def proj(self, x):
         """
@@ -300,9 +387,6 @@ class SelfAttentionBlock(nn.Module):
         self.attn_dropout_rate = dropout
         self.attention_mode = attention_mode
         self.norm1 = nn.LayerNorm(dim)
-
-        self.in_proj = nn.Linear(dim, 3 * dim, bias=True)
-        self.out_proj = nn.Linear(dim, dim, bias=True)
 
         self.drop_path = DropPath(dropout) if dropout > 0.0 else nn.Identity()
         self.norm2 = nn.LayerNorm(dim)
@@ -387,15 +471,15 @@ class LocalSelfAttentionBlock(nn.Module):
         self.attention_mode = attention_mode
         self.norm1 = nn.LayerNorm(dim)
 
-        self.in_proj = nn.Linear(dim, 3 * dim, bias=True)
-        self.out_proj = nn.Linear(dim, dim, bias=True)
-
         self.drop_path = DropPath(dropout) if dropout > 0.0 else nn.Identity()
         self.norm2 = nn.LayerNorm(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=nn.GELU, drop=dropout)
         self.rel_proj = nn.Linear(dim, dim)
         self.rel_v_proj = nn.Linear(dim, dim)
+
+        self.to_g = nn.Linear(2 * dim, dim)
+        self.to_s = nn.Linear(dim, dim)
 
         self.local_attn = MultiheadAttentionLocal(dim, heads, dropout)
 
@@ -415,13 +499,6 @@ class LocalSelfAttentionBlock(nn.Module):
         shortcut = x
         x_norm = self.norm1(x)
 
-        qkv = self.in_proj(x_norm).reshape(B, N, H, 3 * d)
-        q, k, v = torch.split(qkv, d, dim=-1)
-
-        q = q.reshape(B * N, H, d)
-        k = k.reshape(B * N, H, d)
-        v = v.reshape(B * N, H, d)
-
         batch_cnt = [N] * B
 
         local_rel = None
@@ -431,6 +508,12 @@ class LocalSelfAttentionBlock(nn.Module):
             if self.attention_mode == "full":
                 local_rel_v = self.rel_v_proj(rel_enc_sparse).reshape(B * N, L, H, d)
 
+            query_idx = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1).reshape(-1)
+            self_mask = (index_pair == query_idx.unsqueeze(-1))
+            local_rel = local_rel.masked_fill(self_mask.unsqueeze(-1).unsqueeze(-1), 0.0)
+            if local_rel_v is not None:
+                local_rel_v = local_rel_v.masked_fill(self_mask.unsqueeze(-1).unsqueeze(-1), 0.0)
+
         local_attn_mask = None
         if mask is not None:
             batch_ids = torch.arange(B, device=x.device).repeat_interleave(N)
@@ -438,23 +521,23 @@ class LocalSelfAttentionBlock(nn.Module):
             local_attn_mask = local_attn_mask | (index_pair == -1)
 
         value, _ = self.local_attn(
-            query=x.reshape(B * N, D),
-            key=x.reshape(B * N, D),
-            value=x.reshape(B * N, D),
+            query=x_norm.reshape(B * N, D),
+            key=x_norm.reshape(B * N, D),
+            value=x_norm.reshape(B * N, D),
             index_pair=index_pair,
             query_batch_cnt=batch_cnt,
             key_batch_cnt=batch_cnt,
             attn_mask=local_attn_mask,
             relation_encodings=local_rel,
             rel_v=local_rel_v,
-            q_proj=q, k_proj=k, v_proj=v,
-            skip_out_proj=True,
         )
         value = value.reshape(B, N, D)
-        value = self.out_proj(value)
 
-        x = shortcut + self.drop_path(value)
+        g = torch.sigmoid(self.to_g(torch.cat([value, shortcut], dim=-1)))
+        x = value + g * (self.to_s(shortcut) - value)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
+        if mask is not None:
+            x = x * (~mask).float().unsqueeze(-1)
         return x
 
 
@@ -481,7 +564,6 @@ class AgentFusionEncoder(nn.Module):
         x: B, P, V, D (x, y, cos, sin, vx, vy, w, l, z)
         agent_type: B, P, 1 (type)
         '''
-        # TODO: improve time encoding
         # aggragate infos from history with timestep diff embedding
         # and spatial embedding to the last pos to form feature
         x = x[..., :8]
@@ -523,6 +605,318 @@ class AgentFusionEncoder(nn.Module):
         return x_result.view(B, P, -1) , mask_p.reshape(B, -1), pos.view(B, P, -1)
 
 
+class AgentEncoder(nn.Module):
+    def __init__(self, time_len, drop_path_rate=0.3, hidden_dim=192, depth_self=2,
+                 depth_cross=1, num_heads=6):
+        super().__init__()
+
+        self._hidden_dim = hidden_dim
+        self._channel = hidden_dim
+        self._time_len = time_len
+        self._num_heads = num_heads
+
+        self.type_emb = nn.Embedding(4, hidden_dim)
+
+        self.pos_proj = FourierEmbedding(input_dim=2, hidden_dim=hidden_dim, num_freq_bands=32)    # x, y
+        self.head_proj = nn.Linear(2, hidden_dim)   # cos, sin ([-1, 1])
+        self.vel_proj = nn.Linear(2, hidden_dim)    # vx, vy (0~20)
+        self.size_proj = FourierEmbedding(input_dim=3, hidden_dim=hidden_dim, num_freq_bands=16)   # w, l, z
+        self.input_proj = Mlp(
+            in_features=hidden_dim, hidden_features=hidden_dim,
+            out_features=hidden_dim, act_layer=nn.GELU, drop=0.
+        )
+
+        self.time_emb = FourierEmbedding(
+            input_dim=1, hidden_dim=hidden_dim, num_freq_bands=16
+        )
+
+        # ---- Phase 1: Bidirectional Self-Attention (refine all frames) ----
+        self.sa_layers = nn.ModuleList([
+            nn.MultiheadAttention(
+                embed_dim=hidden_dim, num_heads=num_heads,
+                dropout=drop_path_rate, batch_first=True
+            ) for _ in range(depth_self)
+        ])
+        self.sa_norms = nn.ModuleList([
+            nn.LayerNorm(hidden_dim) for _ in range(depth_self)
+        ])
+        self.sa_ffn_norms = nn.ModuleList([
+            nn.LayerNorm(hidden_dim) for _ in range(depth_self)
+        ])
+        self.sa_ffn_layers = nn.ModuleList([
+            Mlp(
+                in_features=hidden_dim, hidden_features=hidden_dim * 4,
+                out_features=hidden_dim, act_layer=nn.GELU, drop=drop_path_rate
+            ) for _ in range(depth_self)
+        ])
+
+        # ---- Phase 2: Cross-Attention (aggregate refined frames to last frame) ----
+        self.ca_layers = nn.ModuleList([
+            nn.MultiheadAttention(
+                embed_dim=hidden_dim, num_heads=num_heads,
+                dropout=drop_path_rate, batch_first=True
+            ) for _ in range(depth_cross)
+        ])
+        self.ca_q_norms = nn.ModuleList([
+            nn.LayerNorm(hidden_dim) for _ in range(depth_cross)
+        ])
+        self.ca_kv_norms = nn.ModuleList([
+            nn.LayerNorm(hidden_dim) for _ in range(depth_cross)
+        ])
+        self.ca_ffn_norms = nn.ModuleList([
+            nn.LayerNorm(hidden_dim) for _ in range(depth_cross)
+        ])
+        self.ca_ffn_layers = nn.ModuleList([
+            Mlp(
+                in_features=hidden_dim, hidden_features=hidden_dim * 4,
+                out_features=hidden_dim, act_layer=nn.GELU, drop=drop_path_rate
+            ) for _ in range(depth_cross)
+        ])
+
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.emb_project = Mlp(
+            in_features=hidden_dim, hidden_features=hidden_dim,
+            out_features=hidden_dim, act_layer=nn.GELU, drop=drop_path_rate
+        )
+
+    def forward(self, x, agent_type):
+        '''
+        x: B, P, V, D (x, y, cos, sin, vx, vy, w, l, z)
+        agent_type: B, P, 1 (type)
+        '''
+        B, P, V, _ = x.shape
+
+        pos = x[:, :, -1, :8].clone()
+        pos[..., -4:] = 0.0
+        pos[..., -4] = 1.0
+
+        mask_v = torch.sum(torch.ne(x[..., :8], 0), dim=-1) == 0  # [B, P, V]
+        mask_p = torch.sum(~mask_v, dim=-1) == 0                  # [B, P]
+
+        x = x.view(B * P, V, -1)                      # [B*P, V, 9]
+        mask_v_flat = mask_v.view(B * P, V)           # [B*P, V]
+        valid_indices = ~mask_p.view(-1)              # [B*P]
+        x = x[valid_indices]                          # [N, V, 9]
+        mask_v_valid = mask_v_flat[valid_indices]     # [N, V]
+        N = x.shape[0]
+
+        if N == 0:
+            x_result = torch.zeros(B * P, self._hidden_dim, device=x.device)
+            return x_result.view(B, P, -1), mask_p.reshape(B, -1), pos.view(B, P, -1)
+
+        x_pos = self.pos_proj(x[..., 0:2].unsqueeze(1)).squeeze(1)   # x, y
+        x_head = self.head_proj(x[..., 2:4])  # cos, sin
+        x_vel = self.vel_proj(x[..., 4:6])    # vx, vy
+        x_size = self.size_proj(x[..., 6:9].unsqueeze(1)).squeeze(1)  # w, l, z
+        x = self.input_proj(x_pos + x_head + x_vel + x_size)  # [N, V, C]
+
+        delta_t = (torch.arange(V, device=x.device, dtype=torch.float32) - (V - 1)) / max(V - 1, 1)
+        delta_t_input = delta_t.view(1, 1, V, 1).expand(N, 1, V, 1)  # [N, 1, V, 1]
+        time_emb = self.time_emb(delta_t_input).squeeze(1)            # [N, V, C]
+
+        x = x + time_emb  # [N, V, C]
+
+        agent_type = agent_type.long().view(B * P)
+        agent_type = agent_type[valid_indices]  # [N, 1]
+        x = x + self.type_emb(agent_type).unsqueeze(1)  # [N, V, C]
+
+        # ---- Phase 1: Bidirectional Self-Attention ----
+        # All frames attend to all frames (no causal mask), building full-context representations
+        for i, attn in enumerate(self.sa_layers):
+            residual = x
+            x_norm = self.sa_norms[i](x)
+            x, _ = attn(x_norm, x_norm, x_norm, key_padding_mask=mask_v_valid)
+            x = x + residual
+
+            residual = x
+            x_norm = self.sa_ffn_norms[i](x)
+            x = self.sa_ffn_layers[i](x_norm)
+            x = x + residual
+
+        # ---- Phase 2: Cross-Attention ----
+        # Q = last frame (full-context summary), K/V = all refined frames
+        q = x[:, -1:, :]  # [N, 1, C]
+        for i, attn in enumerate(self.ca_layers):
+            residual = q
+            q = self.ca_q_norms[i](q)
+            kv = self.ca_kv_norms[i](x)
+            q, _ = attn(q, kv, kv, key_padding_mask=mask_v_valid)
+            q = q + residual
+
+            residual = q
+            q = self.ca_ffn_norms[i](q)
+            q = self.ca_ffn_layers[i](q)
+            q = q + residual
+
+        x = q.squeeze(1)  # [N, C]
+
+        x = self.emb_project(self.norm(x))
+
+        x_result = torch.zeros((B * P, x.shape[-1]), device=x.device)
+        x_result[valid_indices] = x
+
+        return x_result.view(B, P, -1), mask_p.reshape(B, -1), pos.view(B, P, -1)
+
+
+# class AgentEncoder(nn.Module):
+#     def __init__(self, time_len, dropout_rate=0.3, hidden_dim=192, depth_self=2, depth_cross=1,
+#                  num_heads=6):
+#         super().__init__()
+
+#         self._hidden_dim = hidden_dim
+#         self._channel = hidden_dim
+#         self._time_len = time_len
+#         self._num_heads = num_heads
+
+#         self.type_emb = nn.Embedding(4, hidden_dim)
+
+#         self.input_proj = Mlp(
+#             in_features=9, hidden_features=hidden_dim,
+#             out_features=hidden_dim, act_layer=nn.GELU, drop=0.
+#         )
+
+#         self.time_emb = FourierEmbedding(
+#             input_dim=1, hidden_dim=hidden_dim, num_freq_bands=16
+#         )
+
+#         # ---- Phase 1: Causal Self-Attention (refine historical features) ----
+#         self.sa_layers = nn.ModuleList([
+#             nn.MultiheadAttention(
+#                 embed_dim=hidden_dim, num_heads=num_heads,
+#                 dropout=dropout_rate, batch_first=True
+#             ) for _ in range(depth_self)
+#         ])
+#         self.sa_norm1 = nn.ModuleList([
+#             nn.LayerNorm(hidden_dim) for _ in range(depth_self)
+#         ])
+#         self.sa_norm1t = nn.ModuleList([
+#             nn.LayerNorm(hidden_dim) for _ in range(depth_self)
+#         ])
+#         self.sa_norm2 = nn.ModuleList([
+#             nn.LayerNorm(hidden_dim) for _ in range(depth_self)
+#         ])
+#         self.sa_ffn_layers = nn.ModuleList([
+#             Mlp(
+#                 in_features=hidden_dim, hidden_features=hidden_dim * 4,
+#                 out_features=hidden_dim, act_layer=nn.GELU, drop=dropout_rate
+#             ) for _ in range(depth_self)
+#         ])
+
+#         # ---- Phase 2: Cross-Attention (aggregate refined history to last frame) ----
+#         self.ca_layers = nn.ModuleList([
+#             nn.MultiheadAttention(
+#                 embed_dim=hidden_dim, num_heads=num_heads,
+#                 dropout=dropout_rate, batch_first=True
+#             ) for _ in range(depth_cross)
+#         ])
+#         self.ca_q_norms = nn.ModuleList([
+#             nn.LayerNorm(hidden_dim) for _ in range(depth_cross)
+#         ])
+#         self.ca_kv_norms = nn.ModuleList([
+#             nn.LayerNorm(hidden_dim) for _ in range(depth_cross)
+#         ])
+#         self.ca_ffn_norms = nn.ModuleList([
+#             nn.LayerNorm(hidden_dim) for _ in range(depth_cross)
+#         ])
+#         self.ca_ffn_layers = nn.ModuleList([
+#             Mlp(
+#                 in_features=hidden_dim, hidden_features=hidden_dim * 4,
+#                 out_features=hidden_dim, act_layer=nn.GELU, drop=dropout_rate
+#             ) for _ in range(depth_cross)
+#         ])
+
+#         self.norm = nn.LayerNorm(hidden_dim)
+#         self.emb_project = Mlp(
+#             in_features=hidden_dim, hidden_features=hidden_dim,
+#             out_features=hidden_dim, act_layer=nn.GELU, drop=dropout_rate
+#         )
+
+#     def forward(self, x, agent_type):
+#         '''
+#         x: B, P, V, D (x, y, cos, sin, vx, vy, w, l, z)
+#         agent_type: B, P, 1 (type)
+#         '''
+#         B, P, V, _ = x.shape
+
+#         pos = x[:, :, -1, :8].clone()
+#         pos[..., -4:] = 0.0
+#         pos[..., -4] = 1.0
+
+#         mask_v = torch.sum(torch.ne(x[..., :8], 0), dim=-1) == 0  # [B, P, V]
+#         mask_p = torch.sum(~mask_v, dim=-1) == 0                  # [B, P]
+
+#         x = x.view(B * P, V, -1)                      # [B*P, V, 9]
+#         mask_v_flat = mask_v.view(B * P, V)           # [B*P, V]
+#         valid_indices = ~mask_p.view(-1)              # [B*P]
+#         x = x[valid_indices]                          # [N, V, 9]
+#         mask_v_valid = mask_v_flat[valid_indices]     # [N, V]
+#         N = x.shape[0]
+
+#         if N == 0:
+#             x_result = torch.zeros(B * P, self._hidden_dim, device=x.device)
+#             return x_result.view(B, P, -1), mask_p.reshape(B, -1), pos.view(B, P, -1)
+
+#         x = self.input_proj(x)  # [N, V, C]
+
+#         # Time encoding: shared across all frames
+#         delta_t = (torch.arange(V, device=x.device, dtype=torch.float32) - (V - 1)) / max(V - 1, 1)
+#         delta_t_input = delta_t.view(1, 1, V, 1).expand(N, 1, V, 1)  # [N, 1, V, 1]
+#         time_emb = self.time_emb(delta_t_input).squeeze(1)            # [N, V, C]
+
+#         x_t = x + time_emb  # [N, V, C]
+
+#         # Build causal mask: frame i can only attend to frames <= i
+#         causal_mask = torch.triu(
+#             torch.ones(V, V, device=x.device, dtype=torch.bool), diagonal=1
+#         )
+#         causal_mask = causal_mask.float().masked_fill(causal_mask, float('-inf'))
+
+#         # ---- Phase 1: Causal Self-Attention ----
+#         # Each frame attends to its own history, building causal summaries
+#         for i, attn in enumerate(self.sa_layers):
+#             residual = x
+#             x_norm = self.sa_norm1[i](x)
+#             xt_norm = self.sa_norm1t[i](x_t)
+#             x, _ = attn(x_norm, xt_norm, xt_norm,
+#                          key_padding_mask=mask_v_valid, attn_mask=causal_mask)
+#             x = x + residual
+
+#             residual = x
+#             x_norm = self.sa_norm2[i](x)
+#             x = self.sa_ffn_layers[i](x_norm)
+#             x = x + residual
+
+#         # ---- Phase 2: Cross-Attention ----
+#         # Q = last frame (causal summary of full history)
+#         # K/V = refined features of all frames (fixed)
+#         q = x[:, -1:, :]                                # [N, 1, C]
+#         x = x + time_emb
+
+#         for i, attn in enumerate(self.ca_layers):
+#             residual = q
+#             q = self.ca_q_norms[i](q)
+#             kv = self.ca_kv_norms[i](x)
+#             q, _ = attn(q, kv, kv, key_padding_mask=mask_v_valid)
+#             q = q + residual
+
+#             residual = q
+#             q = self.ca_ffn_norms[i](q)
+#             q = self.ca_ffn_layers[i](q)
+#             q = q + residual
+
+#         x = q.squeeze(1)  # [N, C]
+
+#         agent_type = agent_type.long().view(B * P)
+#         agent_type = agent_type[valid_indices]
+#         x = x + self.type_emb(agent_type)
+
+#         x = self.emb_project(self.norm(x))
+
+#         x_result = torch.zeros((B * P, x.shape[-1]), device=x.device)
+#         x_result[valid_indices] = x
+
+#         return x_result.view(B, P, -1), mask_p.reshape(B, -1), pos.view(B, P, -1)
+
 class StaticMapFusionEncoder(nn.Module):
     def __init__(self, static_map_len, drop_path_rate=0.3, depth=3, tokens_mlp_dim=64, hidden_dim=192, channels_mlp_dim=128, device='cuda',
                  shared_backbone: VectorMapBackbone = None):
@@ -535,10 +929,10 @@ class StaticMapFusionEncoder(nn.Module):
 
         self.type_emb = nn.Embedding(3, channels_mlp_dim)
 
-        self.token_pre_project = Mlp(
-            in_features=static_map_len, hidden_features=tokens_mlp_dim,
-            out_features=tokens_mlp_dim, act_layer=nn.GELU, drop=0.
-        )
+        # self.token_pre_project = Mlp(
+        #     in_features=static_map_len, hidden_features=tokens_mlp_dim,
+        #     out_features=tokens_mlp_dim, act_layer=nn.GELU, drop=0.
+        # )
 
         if shared_backbone is not None:
             self.backbone = shared_backbone
@@ -570,9 +964,9 @@ class StaticMapFusionEncoder(nn.Module):
         x = x[valid_indices] 
 
         x = self.backbone.channel_pre_project(x)
-        x = x.permute(0, 2, 1)
-        x = self.token_pre_project(x)
-        x = x.permute(0, 2, 1)
+        # x = x.permute(0, 2, 1)
+        # x = self.token_pre_project(x)
+        # x = x.permute(0, 2, 1)
         x = self.backbone.mix(x)
 
         static_map_type = static_map_type.long().view(B * P)
@@ -596,15 +990,15 @@ class LaneFusionEncoder(nn.Module):
         self._lane_len = lane_len
         self._channel = channels_mlp_dim
 
-        self.speed_limit_emb = nn.Linear(1, channels_mlp_dim)
-        self.unknown_speed_emb = nn.Embedding(1, channels_mlp_dim)
+        # self.speed_limit_emb = nn.Linear(1, channels_mlp_dim)
+        # self.unknown_speed_emb = nn.Embedding(1, channels_mlp_dim)
         self.traffic_emb = nn.Embedding(9, channels_mlp_dim)
         self.type_emb = nn.Embedding(4, channels_mlp_dim)
 
-        self.token_pre_project = Mlp(
-            in_features=lane_len, hidden_features=tokens_mlp_dim,
-            out_features=tokens_mlp_dim, act_layer=nn.GELU, drop=0.
-        )
+        # self.token_pre_project = Mlp(
+        #     in_features=lane_len, hidden_features=tokens_mlp_dim,
+        #     out_features=tokens_mlp_dim, act_layer=nn.GELU, drop=0.
+        # )
 
         if shared_backbone is not None:
             self.backbone = shared_backbone
@@ -637,44 +1031,34 @@ class LaneFusionEncoder(nn.Module):
         x = x.view(B * P, V, -1)
 
         valid_indices = ~mask_p.view(-1) 
-        x = x[valid_indices] 
+        x = x[valid_indices]
 
         x = self.backbone.channel_pre_project(x)
-        x = x.permute(0, 2, 1)
-        x = self.token_pre_project(x)
-        x = x.permute(0, 2, 1)
+        # x = x.permute(0, 2, 1)
+        # x = self.token_pre_project(x)
+        # x = x.permute(0, 2, 1)
         x = self.backbone.mix(x)
 
         # Reshape speed_limit and traffic to match flattened dimensions
-        speed_limit = speed_limit.view(B * P, 1)
-        has_speed_limit = has_speed_limit.view(B * P, 1)
+        # speed_limit = speed_limit.view(B * P, 1)
+        # has_speed_limit = has_speed_limit.view(B * P, 1)
         traffic = traffic.long().view(B * P)
 
         # Apply embedding directly to valid speed limit data
-        has_speed_limit = has_speed_limit[valid_indices].squeeze(-1)
-        speed_limit = speed_limit[valid_indices].squeeze(-1)
+        # has_speed_limit = has_speed_limit[valid_indices].squeeze(-1)
+        # speed_limit = speed_limit[valid_indices].squeeze(-1)
         # speed_limit_embedding = torch.zeros((speed_limit.shape[0], self._channel), device=x.device)
 
-        # if has_speed_limit.sum() > 0:
-        #     speed_limit_with_limit = self.speed_limit_emb(speed_limit[has_speed_limit].unsqueeze(-1))
-        #     speed_limit_embedding[has_speed_limit] = speed_limit_with_limit
+        # unknown_indices = torch.zeros(speed_limit.shape[0], dtype=torch.long, device=x.device)
+        # unknown_emb_all = self.unknown_speed_emb(unknown_indices)  # [B*P, C]
 
-        # if (~has_speed_limit).sum() > 0:
-        #     speed_limit_no_limit = self.unknown_speed_emb.weight.expand(
-        #         (~has_speed_limit).sum().item(), -1
-        #     )
-        #     speed_limit_embedding[~has_speed_limit] = speed_limit_no_limit
-        
-        unknown_indices = torch.zeros(speed_limit.shape[0], dtype=torch.long, device=x.device)
-        unknown_emb_all = self.unknown_speed_emb(unknown_indices)  # [B*P, C]
+        # speed_limit_emb_all = self.speed_limit_emb(speed_limit.unsqueeze(-1))  # [V, C]
 
-        speed_limit_emb_all = self.speed_limit_emb(speed_limit.unsqueeze(-1))  # [V, C]
-
-        speed_limit_embedding = torch.where(
-            has_speed_limit.unsqueeze(-1).bool(),   # [V, 1] -> broadcast to [V, C]
-            speed_limit_emb_all,
-            unknown_emb_all
-        )
+        # speed_limit_embedding = torch.where(
+        #     has_speed_limit.unsqueeze(-1).bool(),   # [V, 1] -> broadcast to [V, C]
+        #     speed_limit_emb_all,
+        #     unknown_emb_all
+        # )
 
         # Process traffic lights directly for valid positions
         traffic = traffic[valid_indices]
@@ -684,7 +1068,7 @@ class LaneFusionEncoder(nn.Module):
         lane_type = lane_type[valid_indices]
         type_embedding = self.type_emb(lane_type)
 
-        x = x + speed_limit_embedding + traffic_light_embedding + type_embedding
+        x = x + traffic_light_embedding + type_embedding
         x = self.backbone.proj(x)
 
         x_result = torch.zeros((B * P, x.shape[-1]), device=x.device)
@@ -702,10 +1086,10 @@ class RoadlineFusionEncoder(nn.Module):
 
         self.type_emb = nn.Embedding(12, channels_mlp_dim)
 
-        self.token_pre_project = Mlp(
-            in_features=roadline_len, hidden_features=tokens_mlp_dim,
-            out_features=tokens_mlp_dim, act_layer=nn.GELU, drop=0.
-        )
+        # self.token_pre_project = Mlp(
+        #     in_features=roadline_len, hidden_features=tokens_mlp_dim,
+        #     out_features=tokens_mlp_dim, act_layer=nn.GELU, drop=0.
+        # )
 
         if shared_backbone is not None:
             self.backbone = shared_backbone
@@ -737,9 +1121,9 @@ class RoadlineFusionEncoder(nn.Module):
         x = x[valid_indices]
 
         x = self.backbone.channel_pre_project(x)
-        x = x.permute(0, 2, 1)
-        x = self.token_pre_project(x)
-        x = x.permute(0, 2, 1)
+        # x = x.permute(0, 2, 1)
+        # x = self.token_pre_project(x)
+        # x = x.permute(0, 2, 1)
         x = self.backbone.mix(x)
 
         roadline_type = roadline_type.long().view(B * P)
@@ -761,14 +1145,21 @@ class TrafficLightEncoder(nn.Module):
 
     def forward(self, inputs):
         # inputs [B, TL, 3] - (x, y, traffic_light_state)
-        traffic_light_type = inputs[:, :, 2].long().clamp(0, 8)
-        type_embed = self.type_embed(traffic_light_type)
-        output = type_embed
+        B, P, _ = inputs.shape
 
-        # Generate mask: True means invalid/padded
+        traffic_light_type = inputs[:, :, 2].long().clamp(0, 8)
         mask = torch.eq(inputs.sum(-1), 0)
 
-        return output, mask
+        valid_indices = ~mask.view(-1)
+        traffic_light_type = traffic_light_type.view(-1)
+        traffic_light_type = traffic_light_type[valid_indices]
+
+        type_embed = self.type_embed(traffic_light_type)
+
+        output = torch.zeros((B * P, type_embed.shape[-1]), device=inputs.device)
+        output[valid_indices] = type_embed
+
+        return output.view(B, P, -1), mask
 
 class FusionEncoder(nn.Module):
     def __init__(self, hidden_dim=192, num_heads=6, drop_path_rate=0.3, depth=3, device='cuda', rel_encoder=None):
@@ -784,8 +1175,8 @@ class FusionEncoder(nn.Module):
         self.rel_encoder = rel_encoder
 
     def forward(self, x, mask, index_pair, relations=None):
-        mask = mask.clone()
-        mask[:, 0] = False
+        # mask = mask.clone()
+        # mask[:, 0] = False
 
         rel_enc_sparse = None
         if relations is not None and self.rel_encoder is not None:
@@ -798,12 +1189,140 @@ class FusionEncoder(nn.Module):
             rel_sparse = relations[batch_idx, query_idx, index_pair_2d.clamp(min=0), :]
             rel_enc_sparse = self.rel_encoder(rel_sparse).reshape(B * N, L, -1)
 
-        # TODO: split agent and map features
         for b in self.blocks:
             x = b(x, mask, index_pair, rel_enc_sparse)
 
         return self.norm(x)
 
+
+
+class LocalCrossAttentionBlock(nn.Module):
+    """
+    Local cross-attention block: query tokens attend to key/value tokens via index_pair.
+    query attends to a subset of key_value specified by index_pair.
+    """
+    def __init__(self, dim=192, heads=6, dropout=0.1, mlp_ratio=4.0, attention_mode="full"):
+        super().__init__()
+        self.num_heads = heads
+        self.head_dim = dim // heads
+        self.attn_dropout_rate = dropout
+        self.attention_mode = attention_mode
+
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+
+        self.drop_path = DropPath(dropout) if dropout > 0.0 else nn.Identity()
+        self.norm2 = nn.LayerNorm(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=nn.GELU, drop=dropout)
+        self.rel_proj = nn.Linear(dim, dim)
+        self.rel_v_proj = nn.Linear(dim, dim)
+
+        self.to_g = nn.Linear(2 * dim, dim)
+        self.to_s = nn.Linear(dim, dim)
+
+        self.local_attn = MultiheadAttentionLocal(dim, heads, dropout)
+
+    def forward(self, query, key_value, query_mask, kv_mask, index_pair, rel_enc_sparse=None):
+        """
+        Args:
+            query: [B, N_q, D] query tokens (e.g., agents)
+            key_value: [B, N_kv, D] key/value tokens (e.g., maps)
+            query_mask: [B, N_q] bool, True=invalid/padded
+            kv_mask: [B, N_kv] bool, True=invalid/padded
+            index_pair: [B*N_q, L] local attention indices into key_value, -1 for padding
+            rel_enc_sparse: [B*N_q, L, D] pre-encoded sparse relations
+        """
+        B, N_q, D = query.shape
+        N_kv = key_value.shape[1]
+        H = self.num_heads
+        d = self.head_dim
+
+        shortcut = query
+        q_norm = self.norm_q(query)
+        kv_norm = self.norm_kv(key_value)
+
+        batch_cnt_q = [N_q] * B
+        batch_cnt_kv = [N_kv] * B
+
+        local_rel = None
+        local_rel_v = None
+        if rel_enc_sparse is not None:
+            L = index_pair.shape[1]
+            local_rel = self.rel_proj(rel_enc_sparse).reshape(B * N_q, L, H, d)
+            if self.attention_mode == "full":
+                local_rel_v = self.rel_v_proj(rel_enc_sparse).reshape(B * N_q, L, H, d)
+
+        local_attn_mask = None
+        if kv_mask is not None:
+            batch_ids = torch.arange(B, device=query.device).repeat_interleave(N_q)
+            local_attn_mask = kv_mask[batch_ids[:, None], index_pair.clamp(min=0)]
+            local_attn_mask = local_attn_mask | (index_pair == -1)
+
+        value, _ = self.local_attn(
+            query=q_norm.reshape(B * N_q, D),
+            key=kv_norm.reshape(B * N_kv, D),
+            value=kv_norm.reshape(B * N_kv, D),
+            index_pair=index_pair,
+            query_batch_cnt=batch_cnt_q,
+            key_batch_cnt=batch_cnt_kv,
+            attn_mask=local_attn_mask,
+            relation_encodings=local_rel,
+            rel_v=local_rel_v,
+        )
+        value = value.reshape(B, N_q, D)
+
+        g = torch.sigmoid(self.to_g(torch.cat([value, shortcut], dim=-1)))
+        x = value + g * (self.to_s(shortcut) - value)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+
+        if query_mask is not None:
+            x = x * (~query_mask).float().unsqueeze(-1)  # [B, N_q, 1]
+        return x
+
+
+class CrossFusionEncoder(nn.Module):
+    """
+    Cross-attention fusion encoder: query tokens attend to key/value tokens.
+    Uses LocalCrossAttentionBlock for sparse/local cross-attention.
+    """
+    def __init__(self, hidden_dim=192, num_heads=6, drop_path_rate=0.3, depth=1, device='cuda', rel_encoder=None):
+        super().__init__()
+
+        dpr = drop_path_rate
+
+        self.blocks = nn.ModuleList(
+            [LocalCrossAttentionBlock(hidden_dim, num_heads, dropout=dpr) for i in range(depth)]
+        )
+
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.rel_encoder = rel_encoder
+
+    def forward(self, query, key_value, query_mask, kv_mask, index_pair, relations=None):
+        """
+        Args:
+            query: [B, N_q, D] query tokens (agents)
+            key_value: [B, N_kv, D] key/value tokens (maps)
+            query_mask: [B, N_q] bool, True=invalid
+            kv_mask: [B, N_kv] bool, True=invalid
+            index_pair: [B*N_q, L] indices into key_value for local attention
+            relations: [B, N_q, N_kv, rel_dim] full relation matrix (agent→map)
+        """
+        rel_enc_sparse = None
+        if relations is not None and self.rel_encoder is not None:
+            B, N_q_total, _, _ = relations.shape
+            N_q = query_mask.shape[1]
+            L = index_pair.shape[1]
+            index_pair_2d = index_pair.reshape(B, N_q, L)
+            batch_idx = torch.arange(B, device=query.device)[:, None, None].expand(-1, N_q, L)
+            query_idx = torch.arange(N_q, device=query.device)[None, :, None].expand(B, -1, L)
+            rel_sparse = relations[batch_idx, query_idx, index_pair_2d.clamp(min=0), :]
+            rel_enc_sparse = self.rel_encoder(rel_sparse).reshape(B * N_q, L, -1)
+
+        for b in self.blocks:
+            query = b(query, key_value, query_mask, kv_mask, index_pair, rel_enc_sparse)
+
+        return self.norm(query)
 
 class FourierEmbedding(nn.Module):
     def __init__(self, input_dim, hidden_dim=256, num_freq_bands=8):
@@ -827,9 +1346,18 @@ class FourierEmbedding(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
+        self._init()
+
+    def _init(self):
+        for mlp in self.mlps:
+            nn.init.normal_(mlp[-1].weight, std=1e-4)
+            nn.init.constant_(mlp[-1].bias, 0)
+        nn.init.normal_(self.to_out[-1].weight, std=1e-4)
+        nn.init.constant_(self.to_out[-1].bias, 0)
+
     def forward(self, continuous_inputs):
         B, N1, N2, D = continuous_inputs.shape
-        flat_input = continuous_inputs.view(B * N1 * N2, D)
+        flat_input = continuous_inputs.reshape(B * N1 * N2, D)
 
         x = flat_input.unsqueeze(-1) * self.freqs.weight * 2 * math.pi
         x = torch.cat([x.cos(), x.sin(), flat_input.unsqueeze(-1)], dim=-1)

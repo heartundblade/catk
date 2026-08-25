@@ -24,6 +24,15 @@ class FourierEmbedding(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
+        self._init()
+
+    def _init(self):
+        for mlp in self.mlps:
+            nn.init.normal_(mlp[-1].weight, std=1e-4)
+            nn.init.constant_(mlp[-1].bias, 0)
+        nn.init.normal_(self.to_out[-1].weight, std=1e-4)
+        nn.init.constant_(self.to_out[-1].bias, 0)
+
     def forward(self, continuous_inputs):
         x = continuous_inputs.unsqueeze(-1) * self.freqs.weight * 2 * torch.pi
         x = torch.cat([x.cos(), x.sin(), continuous_inputs.unsqueeze(-1)], dim=-1)
@@ -42,6 +51,16 @@ class RelationEncoder(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        nn.init.constant_(self.relation_angle_encoder[-1].weight, 0)
+        nn.init.constant_(self.relation_angle_encoder[-1].bias, 0)
+        nn.init.normal_(self.fusion[-1].weight, std=1e-4)
+        nn.init.constant_(self.fusion[-1].bias, 0)
 
     def forward(self, relations):
         """
@@ -52,4 +71,4 @@ class RelationEncoder(nn.Module):
         """
         encoded_pos = self.relation_pos_encoder(relations[..., :2])
         encoded_angle = self.relation_angle_encoder(relations[..., 2:])
-        return encoded_pos + encoded_angle
+        return self.fusion(torch.cat([encoded_pos, encoded_angle], dim=-1))
