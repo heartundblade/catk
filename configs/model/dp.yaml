@@ -47,8 +47,8 @@ config:
   polyline_encoder_depth: 2
   encoder_depth: 3
   decoder_depth: 3
-  num_heads: 6
-  hidden_dim: 192
+  num_heads: 8
+  hidden_dim: 128
   local_attn_k: 16
   top_k_intention: 6
   num_modes: 6
@@ -58,6 +58,9 @@ config:
   # Decoder Parameters
   predicted_neighbor_num: 63
   action_len: 2
+  rho_fixed: {1: 0.224, 3: 0.05}
+  num_chunks: 8
+  diffusion_steps: 10
 
   # Guidance Function
   guidance_fn: null

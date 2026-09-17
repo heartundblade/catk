@@ -9,21 +9,21 @@ from torch.nn.functional import smooth_l1_loss, cross_entropy, mse_loss
 import lightning.pytorch as pl
 from lightning.pytorch.utilities import grad_norm
 
-from src.dp.model.module.encoder import Encoder
+from src.dp.model.module.encoder_knn import Encoder
 from src.dp.model.module.decoder import Decoder
-from src.dp.model.module.denoise_qc_decoder import QCDecoder
-# from src.dp.model.module.denoise_decoder import DenoiseDecoder
 from src.dp.model.module.goal_predictor import GoalPredictor
 from src.dp.model.loss.loss import CrossEntropyLoss
-from src.dp.utils.normalizer import StateNormalizer, ObservationNormalizer, ActionNormalizer
+from src.dp.utils.normalizer import ActionNormalizer  # StateNormalizer, ObservationNormalizer
 from src.dp.utils.lr_schedule import CosineAnnealingWarmUpRestarts
 from src.dp.utils.train_utils import (
     transform_coords_to_sdc_frame, 
     transform_coords_to_global_frame, 
     inverse_kinematics, 
+    inverse_kinematics_bicycle,
     batch_transform_trajs_to_local_frame,
     batch_transform_trajs_to_global_frame,
     roll_out,
+    roll_out_bicycle,
     wrap_angle,
 )
 from src.dp.model.module.rel_emb import RelationEncoder
@@ -40,8 +40,8 @@ class Diffusion_Planner(pl.LightningModule):
         self.save_hyperparameters()
         self.cfg = config
 
-        self.state_normalizer = StateNormalizer.from_json(self.cfg)
-        self.observation_normalizer = ObservationNormalizer.from_json(self.cfg.normalization_file_path)
+        # self.state_normalizer = StateNormalizer.from_json(self.cfg)
+        # self.observation_normalizer = ObservationNormalizer.from_json(self.cfg.normalization_file_path)
         self.action_normalizer = ActionNormalizer.from_json(self.cfg)
 
         self.rel_encoder = RelationEncoder(
@@ -51,9 +51,9 @@ class Diffusion_Planner(pl.LightningModule):
         self.encoder = Diffusion_Planner_Encoder(self.cfg, self.rel_encoder)
         self.decoder = Diffusion_Planner_Decoder(self.cfg, self.rel_encoder)
         
-        # Goal predictor
-        self._train_predictor = config.get('train_predictor', True)
-        self.predictor = GoalPredictor(self.cfg) if self._train_predictor else None
+        # # Goal predictor
+        # self._train_predictor = config.get('train_predictor', True)
+        # self.predictor = GoalPredictor(self.cfg) if self._train_predictor else None
         self._predicted_neighbor_num = config.get('predicted_neighbor_num', 31)
         
         # Validation settings
@@ -65,9 +65,12 @@ class Diffusion_Planner(pl.LightningModule):
         self.log_epoch = config.get('log_epoch', -1)
 
         self._action_len = config.get('action_len', 1)
-        self._num_actions = self._future_len // self._action_len
-        self._pi_loss_weight = config.get('pi_loss_weight', 1.0)
-        self.pi_loss = CrossEntropyLoss(reduction='mean')
+        self._num_actions = self._future_len
+        self._action_loss_decay_start_epoch = config.get('action_loss_decay_start_epoch', -1)
+        self._action_loss_decay_end_epoch = config.get('action_loss_decay_end_epoch', -1)
+        # Global ρ per non-holonomic type (pre-computed from training set).
+        # rho_fixed = {1: rho_veh, 3: rho_cyc}. If None, falls back to per-batch median.
+        self._rho_fixed = config.get('rho_fixed', None)
         
         # WOSAC metrics
         if config.get('fast_wosac_metric', False):
@@ -117,14 +120,24 @@ class Diffusion_Planner(pl.LightningModule):
         inputs["static_maps"][..., :4] = transform_coords_to_sdc_frame(inputs["static_maps"][..., :4], inputs['sdc_coord'])
 
         # Transform traffic lights to SDC frame: pad xy to [B, TL, 1, 4], transform, keep state untouched
-        tl = inputs["traffic_light_points"]
-        valid_mask = torch.any(tl != 0, dim=-1)
-        tl_xy = tl[..., :2].unsqueeze(2)  # [B, TL, 1, 2]
-        tl_xy_padded = torch.nn.functional.pad(tl_xy, (0, 2))  # [B, TL, 1, 4]: x, y, 0, 0
-        tl_xy_transformed = transform_coords_to_sdc_frame(tl_xy_padded, inputs['sdc_coord'])
-        tl_result = torch.cat([tl_xy_transformed.squeeze(2)[..., :2], tl[..., 2:]], dim=-1)
-        tl_result[~valid_mask] = 0.0
-        inputs["traffic_light_points"] = tl_result
+        # tl = inputs["traffic_light_points"]
+        # valid_mask = torch.any(tl != 0, dim=-1)
+        # tl_xy = tl[..., :2].unsqueeze(2)  # [B, TL, 1, 2]
+        # tl_xy_padded = torch.nn.functional.pad(tl_xy, (0, 2))  # [B, TL, 1, 4]: x, y, 0, 0
+        # tl_xy_transformed = transform_coords_to_sdc_frame(tl_xy_padded, inputs['sdc_coord'])
+        # tl_result = torch.cat([tl_xy_transformed.squeeze(2)[..., :2], tl[..., 2:]], dim=-1)
+        # tl_result[~valid_mask] = 0.0
+        # inputs["traffic_light_points"] = tl_result
+
+        # Transform lanes_stop_point to SDC frame
+        lsp = inputs["lanes_stop_point"]
+        lsp_valid = torch.any(lsp != 0, dim=-1)
+        lsp_xy = lsp.unsqueeze(2)  # [B, N, 1, 2]
+        lsp_xy_padded = torch.nn.functional.pad(lsp_xy, (0, 2))  # [B, N, 1, 4]
+        lsp_trans = transform_coords_to_sdc_frame(lsp_xy_padded, inputs['sdc_coord'])
+        lsp_trans = lsp_trans.squeeze(2)[..., :2]  # [B, N, 2]
+        lsp_trans[~lsp_valid] = 0.0
+        inputs["lanes_stop_point"] = lsp_trans
 
         # inputs['agents_future'][..., :4] = self.state_normalizer(inputs['agents_future'][..., :4])
         # self._log_output(
@@ -177,14 +190,24 @@ class Diffusion_Planner(pl.LightningModule):
             inputs["lanes"][..., :4] = transform_coords_to_sdc_frame(inputs["lanes"][..., :4], inputs['sdc_coord'])
             inputs["roadlines"][..., :4] = transform_coords_to_sdc_frame(inputs["roadlines"][..., :4], inputs['sdc_coord'])
             inputs["static_maps"][..., :4] = transform_coords_to_sdc_frame(inputs["static_maps"][..., :4], inputs['sdc_coord'])
-            tl = inputs["traffic_light_points"]
-            valid_mask = torch.any(tl != 0, dim=-1)
-            tl_xy = tl[..., :2].unsqueeze(2)  # [B, TL, 1, 2]
-            tl_xy_padded = torch.nn.functional.pad(tl_xy, (0, 2))  # [B, TL, 1, 4]: x, y, 0, 0
-            tl_xy_transformed = transform_coords_to_sdc_frame(tl_xy_padded, inputs['sdc_coord'])
-            tl_result = torch.cat([tl_xy_transformed.squeeze(2)[..., :2], tl[..., 2:]], dim=-1)
-            tl_result[~valid_mask] = 0.0
-            inputs["traffic_light_points"] = tl_result
+            # tl = inputs["traffic_light_points"]
+            # valid_mask = torch.any(tl != 0, dim=-1)
+            # tl_xy = tl[..., :2].unsqueeze(2)  # [B, TL, 1, 2]
+            # tl_xy_padded = torch.nn.functional.pad(tl_xy, (0, 2))  # [B, TL, 1, 4]: x, y, 0, 0
+            # tl_xy_transformed = transform_coords_to_sdc_frame(tl_xy_padded, inputs['sdc_coord'])
+            # tl_result = torch.cat([tl_xy_transformed.squeeze(2)[..., :2], tl[..., 2:]], dim=-1)
+            # tl_result[~valid_mask] = 0.0
+            # inputs["traffic_light_points"] = tl_result
+
+            # Transform lanes_stop_point to SDC frame
+            lsp = inputs["lanes_stop_point"]
+            lsp_valid = torch.any(lsp != 0, dim=-1)
+            lsp_xy = lsp.unsqueeze(2)
+            lsp_xy_padded = torch.nn.functional.pad(lsp_xy, (0, 2))
+            lsp_trans = transform_coords_to_sdc_frame(lsp_xy_padded, inputs['sdc_coord'])
+            lsp_trans = lsp_trans.squeeze(2)[..., :2]
+            lsp_trans[~lsp_valid] = 0.0
+            inputs["lanes_stop_point"] = lsp_trans
             
             loss, loss_dict, decoder_output = self.diffusion_loss_func(
                 inputs=inputs,
@@ -227,18 +250,37 @@ class Diffusion_Planner(pl.LightningModule):
             inputs["lanes"][..., :4] = transform_coords_to_sdc_frame(inputs["lanes"][..., :4], inputs['sdc_coord'])
             inputs["roadlines"][..., :4] = transform_coords_to_sdc_frame(inputs["roadlines"][..., :4], inputs['sdc_coord'])
             inputs["static_maps"][..., :4] = transform_coords_to_sdc_frame(inputs["static_maps"][..., :4], inputs['sdc_coord'])
-            tl = inputs["traffic_light_points"]
-            valid_mask = torch.any(tl != 0, dim=-1)
-            tl_xy = tl[..., :2].unsqueeze(2)
-            tl_xy_padded = torch.nn.functional.pad(tl_xy, (0, 2))
-            tl_xy_transformed = transform_coords_to_sdc_frame(tl_xy_padded, inputs['sdc_coord'])
-            tl_result = torch.cat([tl_xy_transformed.squeeze(2)[..., :2], tl[..., 2:]], dim=-1)
-            tl_result[~valid_mask] = 0.0
-            inputs["traffic_light_points"] = tl_result
+            # tl = inputs["traffic_light_points"]
+            # valid_mask = torch.any(tl != 0, dim=-1)
+            # tl_xy = tl[..., :2].unsqueeze(2)
+            # tl_xy_padded = torch.nn.functional.pad(tl_xy, (0, 2))
+            # tl_xy_transformed = transform_coords_to_sdc_frame(tl_xy_padded, inputs['sdc_coord'])
+            # tl_result = torch.cat([tl_xy_transformed.squeeze(2)[..., :2], tl[..., 2:]], dim=-1)
+            # tl_result[~valid_mask] = 0.0
+            # inputs["traffic_light_points"] = tl_result
+
+            # Transform lanes_stop_point to SDC frame
+            lsp = inputs["lanes_stop_point"]
+            lsp_valid = torch.any(lsp != 0, dim=-1)
+            lsp_xy = lsp.unsqueeze(2)
+            lsp_xy_padded = torch.nn.functional.pad(lsp_xy, (0, 2))
+            lsp_trans = transform_coords_to_sdc_frame(lsp_xy_padded, inputs['sdc_coord'])
+            lsp_trans = lsp_trans.squeeze(2)[..., :2]
+            lsp_trans[~lsp_valid] = 0.0
+            inputs["lanes_stop_point"] = lsp_trans
             
             pred_traj = []
-            for r in range(self._n_rollout_closed_val):
-                print('closed-loop rollout', r)
+            # Compute r from agent type and global ρ (or default 0.25 if not configured)
+            agents_type_cl = inputs["agents_type"]  # [B, P]
+            length = batch['agents_history'][:, :self._predicted_neighbor_num+1, -1, 6]  # [B, P]
+            is_veh_cl = agents_type_cl[:, :self._predicted_neighbor_num+1] == 1
+            is_cyc_cl = agents_type_cl[:, :self._predicted_neighbor_num+1] == 3
+            rho_veh = self._rho_fixed.get(1, 0.25) if self._rho_fixed else 0.25
+            rho_cyc = self._rho_fixed.get(3, 0.25) if self._rho_fixed else 0.25
+            r_cl = torch.where(is_veh_cl, rho_veh * length,
+                              torch.where(is_cyc_cl, rho_cyc * length, torch.zeros_like(length)))  # [B, P]
+            for r_idx in range(self._n_rollout_closed_val):
+                print('closed-loop rollout', r_idx)
                 trajs = []
                 inputs_ = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
                 
@@ -277,41 +319,51 @@ class Diffusion_Planner(pl.LightningModule):
                             batch['agents_future'][..., :6],
                             sdc_coord_global
                         )
-                        tl = inputs["traffic_light_points"]
-                        valid_mask = torch.any(tl != 0, dim=-1)
-                        tl_xy = tl[..., :2].unsqueeze(2)
-                        tl_xy_padded = torch.nn.functional.pad(tl_xy, (0, 2))
-                        tl_xy_transformed = transform_coords_to_sdc_frame(tl_xy_padded, inputs['sdc_coord'])
-                        tl_result = torch.cat([tl_xy_transformed.squeeze(2)[..., :2], tl[..., 2:]], dim=-1)
-                        tl_result[~valid_mask] = 0.0
-                        inputs["traffic_light_points"] = tl_result
+                        # tl = inputs["traffic_light_points"]
+                        # valid_mask = torch.any(tl != 0, dim=-1)
+                        # tl_xy = tl[..., :2].unsqueeze(2)
+                        # tl_xy_padded = torch.nn.functional.pad(tl_xy, (0, 2))
+                        # tl_xy_transformed = transform_coords_to_sdc_frame(tl_xy_padded, inputs['sdc_coord'])
+                        # tl_result = torch.cat([tl_xy_transformed.squeeze(2)[..., :2], tl[..., 2:]], dim=-1)
+                        # tl_result[~valid_mask] = 0.0
+                        # inputs["traffic_light_points"] = tl_result
+
+                        # Transform lanes_stop_point to SDC frame
+                        lsp = batch["lanes_stop_point"]
+                        lsp_valid = torch.any(lsp != 0, dim=-1)
+                        lsp_xy = lsp.unsqueeze(2)
+                        lsp_xy_padded = torch.nn.functional.pad(lsp_xy, (0, 2))
+                        lsp_trans = transform_coords_to_sdc_frame(lsp_xy_padded, sdc_coord_global)
+                        lsp_trans = lsp_trans.squeeze(2)[..., :2]
+                        lsp_trans[~lsp_valid] = 0.0
+                        inputs_sdc["lanes_stop_point"] = lsp_trans
                         
                         current_states_global = prev_pred_global[:, :self._predicted_neighbor_num+1, -1, :6].clone()  # [B, P, 6]
 
-                    inputs_normalized = self.observation_normalizer(inputs_sdc)
-                    # inputs_normalized = inputs_sdc
+                    # inputs_normalized = self.observation_normalizer(inputs_sdc)
+                    inputs_normalized = inputs_sdc
 
                     _, decoder_output = self.forward(inputs_normalized)
                     pred_actions = decoder_output["prediction"]  # [B, P, num_actions, 2]
                     
                     pred_actions = self.action_normalizer.inverse(pred_actions)
-                    pred_trajs_global = roll_out(
+                    pred_trajs_global = roll_out_bicycle(
                         current_states_global,  # [B, P, 6]
-                        pred_actions,
+                        pred_actions[:, :self._predicted_neighbor_num+1],
+                        r=r_cl[:, :self._predicted_neighbor_num+1],
+                        agent_type=agents_type_cl[:, :self._predicted_neighbor_num+1],
                         dt=0.1,
-                        action_len=self._action_len,
-                        global_frame=True,
-                        valid_mask=agents_mask
-                    )  # [B, P, T, 6] - x, y, cos(theta), sin(theta), v_x, v_y
+                        valid_mask=agents_mask,
+                    )  # [B, P, S+1, 6]
 
                     if t == 0:
-                        pred_trajs_local = roll_out(
+                        pred_trajs_local = roll_out_bicycle(
                             inputs_sdc['agents_history'][:, :, -1, :6],  # [B, P, 6]
-                            pred_actions,
+                            pred_actions[:, :self._predicted_neighbor_num+1],
+                            r=r_cl[:, :self._predicted_neighbor_num+1],
+                            agent_type=agents_type_cl[:, :self._predicted_neighbor_num+1],
                             dt=0.1,
-                            action_len=self._action_len,
-                            global_frame=True,
-                            valid_mask=agents_mask
+                            valid_mask=agents_mask,
                         )
                         pred_trajs_local_4d = torch.cat([
                             pred_trajs_local[..., :2],
@@ -520,7 +572,6 @@ class Diffusion_Planner(pl.LightningModule):
                 self.log("grad/clip_factor", clip_factor, on_step=True, on_epoch=True, prog_bar=False)
 
     def on_train_epoch_end(self):
-        """Epoch 结束时输出各模块累积梯度范数，避免 step 级日志量过大。"""
         if not hasattr(self, '_epoch_module_grad_norms') or self._epoch_grad_count == 0:
             return
 
@@ -531,7 +582,7 @@ class Diffusion_Planner(pl.LightningModule):
         sorted_modules = sorted(module_avg_norms.items(), key=lambda x: x[1], reverse=True)
         for rank, (mod_name, avg_norm) in enumerate(sorted_modules[:top_n]):
             short_name = mod_name.replace('decoder.dit.', 'd.').replace('encoder.', 'e.')
-            self.log(f"grad/mod/{short_name}", avg_norm, on_step=False, on_epoch=True, prog_bar=False)
+            self.log(f"grad/mod/{short_name}", avg_norm, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
 
         # enc_norm = sum(
         #     v for k, v in self._epoch_module_grad_norms.items() if k.startswith('encoder')
@@ -560,13 +611,14 @@ class Diffusion_Planner(pl.LightningModule):
         model_type: str,
         eps: float = 1e-3,
     ):
-        inputs_norm = self.observation_normalizer(inputs)
-        # inputs_norm = inputs
+        # inputs_norm = self.observation_normalizer(inputs)
+        inputs_norm = inputs
 
         agents_future = inputs["agents_future"]
         agents_future_norm = inputs_norm["agents_future"]  # [B, P, T+1, 9]
         agents_future_valid = inputs_norm["agents_future_valid"]  # [B, P, T+1]
         agents_interested = inputs_norm["agents_interested"]  # [B, P]
+        agents_type = inputs["agents_type"]  # [B, P], WOMD: 1=VEH, 2=PED, 3=CYC
         B, P, T, _ = agents_future.shape
         
         current_states = inputs["agents_history"][:, :, -1:, :6].clone()  # [B, P, 1, 6]
@@ -577,17 +629,18 @@ class Diffusion_Planner(pl.LightningModule):
         # future_mask = agents_future_valid[..., 1:].clone()  # [B, P, T]
         future_mask = agents_future_valid[..., 1:]*(agents_interested[..., None]>0)  # [B, P, T]
 
-        # Calculate GT actions using inverse kinematics
-        gt_actions, gt_actions_valid = inverse_kinematics(
+        # Calculate GT actions using bicycle inverse kinematics
+        gt_actions, gt_actions_valid, r = inverse_kinematics_bicycle(
             agents_future,
             agents_future_valid,
+            agent_type=agents_type,
             dt=0.1,
-            action_len=self._action_len,
-        )  # gt_actions: [B, P, num_actions, 2], gt_actions_valid: [B, P, num_actions]
+            rho_fixed=self._rho_fixed,
+        )  # gt_actions: [B, P, T-1, 3], gt_actions_valid: [B, P, T-1], r: [B, P]
 
         if self.training:
             t = torch.rand(B, device=agents_future.device) * (1 - eps) + eps # [B,]
-            z = torch.randn_like(gt_actions, device=agents_future.device) # [B, P, num_actions, 2]
+            z = torch.randn_like(gt_actions, device=agents_future.device) # [B, P, T-1, 3]
 
             # # for debug
             # t = torch.full_like(t, eps)
@@ -609,18 +662,17 @@ class Diffusion_Planner(pl.LightningModule):
             }
 
             encoder_outputs, decoder_output = self.forward(merged_inputs)
-            pred_actions = decoder_output["score"]  # [B, P, num_actions, 2]
+            pred_actions = decoder_output["score"]  # [B, P, T-1, 3]
             pred_actions_norm = decoder_output["score"].clone()
 
             pred_actions = norm.inverse(pred_actions)
-            pred_trajectories = roll_out(
+            pred_trajectories = roll_out_bicycle(
                 current_states.squeeze(2),  # [B, P, 6]
                 pred_actions,
+                r=r,
+                agent_type=agents_type,
                 dt=0.1,
-                action_len=self._action_len,
-                global_frame=True,
-                training=True
-            )  # [B, P, T, 5]
+            )  # [B, P, S+1, 6]
             
             decoder_output["predicted_trajectories"] = pred_trajectories
 
@@ -635,17 +687,26 @@ class Diffusion_Planner(pl.LightningModule):
             # weight = weight / weight.mean()
             # action_loss = action_loss * weight.view(B, 1, 1)
 
-            accel_loss = smooth_l1_loss(pred_actions_norm[..., 0], gt_actions_norm[..., 0], reduction='none') * gt_actions_valid  # [B, P, num_actions]
-            yaw_rate_loss = smooth_l1_loss(pred_actions_norm[..., 1], gt_actions_norm[..., 1], reduction='none') * gt_actions_valid  # [B, P, num_actions]
+            a_par_loss = smooth_l1_loss(pred_actions_norm[..., 0], gt_actions_norm[..., 0], reduction='none') * gt_actions_valid
+            a_lat_loss = smooth_l1_loss(pred_actions_norm[..., 1], gt_actions_norm[..., 1], reduction='none') * gt_actions_valid
+            a_psi_loss = smooth_l1_loss(pred_actions_norm[..., 2], gt_actions_norm[..., 2], reduction='none') * gt_actions_valid
             valid_count = gt_actions_valid.sum()
 
-            loss_dict["train/accel_loss"] = accel_loss.sum() / valid_count
-            loss_dict["train/yaw_rate_loss"] = yaw_rate_loss.sum() / valid_count
-            loss_dict["train/action_loss"] = (accel_loss.sum() + yaw_rate_loss.sum()) / valid_count
+            loss_dict["train/a_par_loss"] = a_par_loss.sum() / valid_count
+            loss_dict["train/a_lat_loss"] = a_lat_loss.sum() / valid_count
+            loss_dict["train/a_psi_loss"] = a_psi_loss.sum() / valid_count
+            # loss_dict["train/action_loss"] = (a_par_loss.sum() + a_lat_loss.sum() + a_psi_loss.sum()) / valid_count
 
             masked_loss = (state_loss + yaw_loss) * future_mask[:, :self._predicted_neighbor_num+1, :]
-            loss = 0.1 * masked_loss.sum() / future_mask[:, :self._predicted_neighbor_num+1, :].sum() + (accel_loss.sum() + yaw_rate_loss.sum()) / valid_count
-            # loss = (accel_loss.sum() + yaw_rate_loss.sum()) / valid_count
+
+            action_loss_weight = 1.0
+            if self._action_loss_decay_start_epoch >= 0 and self._action_loss_decay_end_epoch > self._action_loss_decay_start_epoch:
+                if self.current_epoch >= self._action_loss_decay_start_epoch:
+                    progress = (self.current_epoch - self._action_loss_decay_start_epoch) / (self._action_loss_decay_end_epoch - self._action_loss_decay_start_epoch)
+                    action_loss_weight = max(0.0, 1.0 - progress)
+
+            # loss = 0.1 * masked_loss.sum() / future_mask[:, :self._predicted_neighbor_num+1, :].sum() + action_loss_weight * (accel_loss.sum() + yaw_rate_loss.sum()) / valid_count
+            loss = (a_par_loss.sum() + a_lat_loss.sum() + a_psi_loss.sum()) / valid_count
 
             # Calculate ADE and FDE metrics
             denoise_mse = torch.norm(pred_trajectories[..., :2] - gt_future_pos, dim=-1)
@@ -661,44 +722,49 @@ class Diffusion_Planner(pl.LightningModule):
         else:
             _, decoder_output = self.forward(inputs_norm)
             # _, decoder_output = self.forward(inputs)
-            pred_actions = decoder_output["prediction"]  # [B, P, num_actions, 2]
+            pred_actions = decoder_output["prediction"]  # [B, P, T-1, 3]
             
             pred_actions = norm.inverse(pred_actions)
             # No mask since mask is applied in loss calculation
-            pred_trajectories = roll_out(
+            pred_trajectories = roll_out_bicycle(
                 current_states[:, :self._predicted_neighbor_num+1, -1, :],  # [B, P, 6]
-                pred_actions,
+                pred_actions[:, :self._predicted_neighbor_num+1],
+                r=r[:, :self._predicted_neighbor_num+1],
+                agent_type=agents_type[:, :self._predicted_neighbor_num+1],
                 dt=0.1,
-                action_len=self._action_len,
-                global_frame=True,
-                training=False
-            )  # [B, P, T, 5]
+            )  # [B, P, S+1, 6]
             
             decoder_output["predicted_trajectories"] = pred_trajectories
             
-            state_loss = smooth_l1_loss(pred_trajectories[..., :2], gt_future_pos[:, :self._predicted_neighbor_num+1, :, :2], reduction='none').sum(-1)  # [B, P, T]
+            pred_traj_len = pred_trajectories.shape[-2]
+            gt_future_pos_trunc = gt_future_pos[:, :self._predicted_neighbor_num+1, :pred_traj_len, :2]
+            state_loss = smooth_l1_loss(pred_trajectories[..., :2], gt_future_pos_trunc, reduction='none').sum(-1)
             
             pred_yaw = torch.atan2(pred_trajectories[..., 3], pred_trajectories[..., 2])
-            yaw_error = pred_yaw - gt_future_yaw[:, :self._predicted_neighbor_num+1, :]  # [B, P, T]
+            gt_future_yaw_trunc = gt_future_yaw[:, :self._predicted_neighbor_num+1, :pred_traj_len]
+            yaw_error = pred_yaw - gt_future_yaw_trunc
             yaw_error = torch.atan2(torch.sin(yaw_error), torch.cos(yaw_error))
-            yaw_loss = yaw_error ** 2  # [B, P, T], MSE
-
+            yaw_loss = yaw_error ** 2
+            
             # loss_dict["val/state_loss"] = (state_loss * future_mask[:, :self._predicted_neighbor_num+1, :]).sum() / future_mask[:, :self._predicted_neighbor_num+1, :].sum()
             # loss_dict["val/yaw_loss"] = (yaw_loss * future_mask[:, :self._predicted_neighbor_num+1, :]).sum() / future_mask[:, :self._predicted_neighbor_num+1, :].sum()
             
-            action_loss = mse_loss(pred_actions, gt_actions[:, :self._predicted_neighbor_num+1, :, :], reduction='none').sum(-1)  # [B, P, num_actions]
-            action_loss = action_loss * gt_actions_valid[:, :self._predicted_neighbor_num+1, :]  # [B, P, num_actions]
-            loss_dict["val/action_loss"] = (action_loss[:, :self._predicted_neighbor_num+1, :]).sum() / gt_actions_valid[:, :self._predicted_neighbor_num+1, :].sum()
+            gt_actions_trunc = gt_actions[:, :self._predicted_neighbor_num+1, :pred_traj_len, :]
+            gt_valid_trunc = gt_actions_valid[:, :self._predicted_neighbor_num+1, :pred_traj_len]
+            action_loss = mse_loss(pred_actions[:, :self._predicted_neighbor_num+1], gt_actions_trunc, reduction='none').sum(-1)
+            action_loss = action_loss * gt_valid_trunc
+            loss_dict["val/action_loss"] = action_loss.sum() / gt_valid_trunc.sum()
 
             # Calculate ADE and FDE metrics
-            denoise_mse = torch.norm(pred_trajectories[..., :2] - gt_future_pos[:, :self._predicted_neighbor_num+1, :, :2], dim=-1)
-            denoise_ADE = denoise_mse[future_mask[:, :self._predicted_neighbor_num+1, :].bool()].mean()
-            denoise_FDE = denoise_mse[..., -1][future_mask[:, :self._predicted_neighbor_num+1, -1].bool()].mean()
+            denoise_mse = torch.norm(pred_trajectories[..., :2] - gt_future_pos_trunc, dim=-1)
+            future_mask_trunc = future_mask[:, :self._predicted_neighbor_num+1, :pred_traj_len]
+            denoise_ADE = denoise_mse[future_mask_trunc.bool()].mean()
+            denoise_FDE = denoise_mse[..., -1][future_mask_trunc[..., -1].bool()].mean()
             loss_dict["val/denoise_ADE"] = denoise_ADE
             loss_dict["val/denoise_FDE"] = denoise_FDE
             
-            masked_loss = (state_loss + yaw_loss) * future_mask[:, :self._predicted_neighbor_num+1, :]
-            loss = masked_loss.sum() / future_mask[:, :self._predicted_neighbor_num+1, :].sum()
+            masked_loss = (state_loss + yaw_loss) * future_mask_trunc
+            loss = masked_loss.sum() / future_mask_trunc.sum()
             # loss = action_loss.sum() / gt_actions_valid.sum()
         
         # neighbor_mask = future_mask[:, 1:self._predicted_neighbor_num+1, :]
@@ -744,6 +810,7 @@ class Diffusion_Planner(pl.LightningModule):
                 'agents_history': batch['agents_history'].cpu().detach().numpy(),
                 'agents_future': batch['agents_future'].cpu().detach().numpy(),
                 'lanes': batch['lanes'].cpu().detach().numpy(),
+                'lanes_stop_point': batch['lanes_stop_point'].cpu().detach().numpy(),
                 'roadlines': batch['roadlines'].cpu().detach().numpy(),
                 'static_maps': batch['static_maps'].cpu().detach().numpy(),
                 'sdc_coord': batch['sdc_coord'].cpu().detach().numpy() if hasattr(batch['sdc_coord'], 'cpu') else batch['sdc_coord'],
@@ -756,6 +823,7 @@ class Diffusion_Planner(pl.LightningModule):
                 'agents_history': batch['agents_history'].cpu().detach().numpy(),
                 'agents_future': batch['agents_future'].cpu().detach().numpy(),
                 'lanes': batch['lanes'].cpu().detach().numpy(),
+                'lanes_stop_point': batch['lanes_stop_point'].cpu().detach().numpy(),
                 'roadlines': batch['roadlines'].cpu().detach().numpy(),
                 'static_maps': batch['static_maps'].cpu().detach().numpy(),
                 'sdc_coord': batch['sdc_coord'].cpu().detach().numpy() if hasattr(batch['sdc_coord'], 'cpu') else batch['sdc_coord'],
@@ -768,6 +836,7 @@ class Diffusion_Planner(pl.LightningModule):
                 'agents_history': batch['agents_history'].cpu().detach().numpy(),
                 'agents_future': batch['agents_future'].cpu().detach().numpy(),
                 'lanes': batch['lanes'].cpu().detach().numpy(),
+                'lanes_stop_point': batch['lanes_stop_point'].cpu().detach().numpy(),
                 'roadlines': batch['roadlines'].cpu().detach().numpy(),
                 'static_maps': batch['static_maps'].cpu().detach().numpy(),
                 'sdc_coord': batch['sdc_coord'].cpu().detach().numpy() if hasattr(batch['sdc_coord'], 'cpu') else batch['sdc_coord'],
@@ -787,28 +856,6 @@ class Diffusion_Planner_Encoder(nn.Module):
         super().__init__()
 
         self.encoder = Encoder(config, rel_encoder=rel_encoder)
-        self.initialize_weights()
-
-    def initialize_weights(self):
-        # Initialize transformer layers:
-        def _basic_init(m):
-            if isinstance(m, nn.Linear):
-                torch.nn.init.xavier_uniform_(m.weight)
-                if isinstance(m, nn.Linear) and m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.constant_(m.bias, 0)
-                nn.init.constant_(m.weight, 1.0)
-            elif isinstance(m, nn.Embedding):
-                nn.init.normal_(m.weight, mean=0.0, std=0.02)
-        self.apply(_basic_init)
-
-        # Initialize embedding MLP:
-        # nn.init.normal_(self.encoder.pos_emb.weight, std=0.02)
-        nn.init.normal_(self.encoder.agents_encoder.type_emb.weight, std=0.02)
-        # nn.init.normal_(self.encoder.lane_encoder.speed_limit_emb.weight, std=0.02)
-        nn.init.normal_(self.encoder.lane_encoder.traffic_emb.weight, std=0.02)
-        # nn.init.normal_(self.encoder.traffic_light_encoder.type_embed.weight, std=0.02)
 
     def forward(self, inputs):
 
@@ -823,39 +870,6 @@ class Diffusion_Planner_Decoder(nn.Module):
 
         self.decoder = Decoder(config, rel_encoder=rel_encoder)
         # self.decoder = QCDecoder(config, rel_encoder=rel_encoder)
-        self.initialize_weights()
-
-    def initialize_weights(self):
-        # Initialize transformer layers:
-        def _basic_init(m):
-            if isinstance(m, nn.Linear):
-                torch.nn.init.xavier_uniform_(m.weight)
-                if isinstance(m, nn.Linear) and m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.constant_(m.bias, 0)
-                nn.init.constant_(m.weight, 1.0)
-            elif isinstance(m, nn.Embedding):
-                nn.init.normal_(m.weight, mean=0.0, std=0.02)
-        self.apply(_basic_init)
-
-        # Initialize timestep embedding MLP:
-        nn.init.normal_(self.decoder.dit.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.decoder.dit.t_embedder.mlp[2].weight, std=0.02)
-
-        # Zero-out adaLN modulation layers in DiT blocks:
-        nn.init.constant_(self.decoder.dit.t_action_modulation[-1].weight, 0)
-        nn.init.constant_(self.decoder.dit.t_action_modulation[-1].bias, 0)
-        for block in self.decoder.dit.chunk_blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-
-        # Zero-out output layers:
-        # nn.init.constant_(self.decoder.dit.final_layer.adaLN_modulation[-1].weight, 0)
-        # nn.init.constant_(self.decoder.dit.final_layer.adaLN_modulation[-1].bias, 0)
-        for head in self.decoder.dit.final_layer.heads:
-            nn.init.constant_(head[-1].weight, 0)
-            nn.init.constant_(head[-1].bias, 0)
 
     def forward(self, encoder_outputs, inputs):
 

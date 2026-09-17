@@ -30,10 +30,6 @@ from src.vbd.data_preprocess.utils import wrap_angle, wrap_to_pi
 from src.dp.data_preprocess.utils import transform_coords_to_sdc_frame
 
 MAX_NUM_OBJECTS = 64
-MAX_LANES = 256
-MAX_ROADLINES = 128
-MAX_STATIC_MAPS = 20
-MAX_TRAFFIC_LIGHTS = 16
 CURRENT_INDEX = 10
 NUM_POINTS_POLYLINE = 30
 NUM_POINTS_STATIC_MAP = 10
@@ -159,32 +155,25 @@ def _compute_polygon_positions(polygons, all_polylines):
     return pos
 
 
-def _filter_by_distance(positions, agents_data, max_count):
+def _filter_by_distance(positions, agents_data):
     """
-    Filter polygons by distance to agents, keeping at most max_count.
+    Sort polygons by distance to agents. No longer truncates here;
+    truncation/padding is deferred to data loading (collate_fn).
     
     Args:
         positions (np.ndarray): [num_polygons, 3, 2] - position array
         agents_data (np.ndarray): Agent positions for reference
-        max_count (int): Maximum number of polygons to keep
     Returns:
-        index (np.ndarray): Indices of selected polygons
+        index (np.ndarray): Indices of all polygons sorted by distance
     """
-    num_polygons = len(positions)
-    if num_polygons > max_count:
-        index = sort_polygons_by_distance(positions, agents_data)
-        return index[:max_count]
-    else:
-        return np.arange(num_polygons)
+    index = sort_polygons_by_distance(positions, agents_data)
+    return index
 
 
 def get_map_features(
         map_infos, 
         tf_current_light, 
         sdc_coord,
-        max_lanes=256,
-        max_roadlines=128,
-        max_static_maps=20,
         num_points_polyline=30,
         num_points_static_map=10,
     ):
@@ -223,9 +212,9 @@ def get_map_features(
     pos_roadlines = _compute_polygon_positions(roadline_polygons, all_polylines)
     pos_static_map = _compute_polygon_positions(static_map_polygons, all_polylines)
 
-    index_lanes = _filter_by_distance(pos_lanes, sdc_coord[:2], max_lanes)
-    index_roadlines = _filter_by_distance(pos_roadlines, sdc_coord[:2], max_roadlines)
-    index_static_maps = _filter_by_distance(pos_static_map, sdc_coord[:2], max_static_maps)
+    index_lanes = _filter_by_distance(pos_lanes, sdc_coord[:2])
+    index_roadlines = _filter_by_distance(pos_roadlines, sdc_coord[:2])
+    index_static_maps = _filter_by_distance(pos_static_map, sdc_coord[:2])
 
     num_lanes = len(index_lanes)
     num_roadlines = len(index_roadlines)
@@ -241,6 +230,7 @@ def get_map_features(
     lane_polylines = []
     lanes_speed_limit = []
     lanes_has_speed_limit = []
+    lanes_stop_point = []
     for idx, polygon in enumerate([lane_polygons[i] for i in index_lanes]):
         polyline_index = polygon["polyline_index"]
         centerline = all_polylines[polyline_index[0]:polyline_index[1], :]
@@ -274,6 +264,14 @@ def get_map_features(
             lanes_has_speed_limit.append(1)
         else:
             lanes_has_speed_limit.append(0)
+
+        stop_res = tf_current_light["traffic_stop_points"][
+            tf_current_light["traffic_lane_ids"] == polygon["id"]
+        ]
+        if len(stop_res) != 0:
+            lanes_stop_point.append(stop_res[0, :2])
+        else:
+            lanes_stop_point.append(np.zeros((2,), dtype=np.float32))
 
         polyline_len = lane_points[idx].shape[0]
         if polyline_len >= num_points_polyline:
@@ -376,6 +374,7 @@ def get_map_features(
         map_data['lanes_valid'] = np.zeros((1,), dtype=np.int32)
         map_data['lanes_speed_limit'] = np.zeros((1, ), dtype=np.float32)
         map_data['lanes_has_speed_limit'] = np.zeros((1, ), dtype=np.int32)
+        map_data['lanes_stop_point'] = np.zeros((1, 2), dtype=np.float32)
     else:
         lane_polylines = np.stack(lane_polylines, axis=0).astype(np.float32)
         # lane_polylines[..., :4] = transform_coords_to_sdc_frame(lane_polylines[..., :4], sdc_coord)
@@ -383,6 +382,7 @@ def get_map_features(
         map_data['lanes_valid'] = np.ones((map_data['lanes'].shape[0],), dtype=np.int32)
         map_data['lanes_speed_limit'] = np.stack(lanes_speed_limit, axis=0).astype(np.float32)
         map_data['lanes_has_speed_limit'] = np.stack(lanes_has_speed_limit, axis=0).astype(np.int32)
+        map_data['lanes_stop_point'] = np.stack(lanes_stop_point, axis=0).astype(np.float32)
 
     if len(roadline_polylines) == 0:
         map_data['roadlines'] = np.zeros((1, num_points_polyline, 5), dtype=np.float32)
@@ -704,7 +704,6 @@ def process_agents(
 
 def process_traffic_lights(
         dynamic_map_states,
-        max_num_traffic_lights=20,
         current_index=10,
     ):
     s = dynamic_map_states[current_index]
@@ -729,28 +728,19 @@ def process_traffic_lights(
         )
     traffic_light_points = np.float32(traffic_light_points)
 
-    num_traffic_lights = traffic_light_points.shape[0]
-    if num_traffic_lights >= max_num_traffic_lights:
-        traffic_light_points = traffic_light_points[:max_num_traffic_lights]
-    else:
-        traffic_light_points = np.pad(
-            traffic_light_points, 
-            ((0, max_num_traffic_lights-num_traffic_lights), (0, 0))
-        )
+    # Truncation/padding deferred to data loading (collate_fn)
 
     return {
         'traffic_light_points': traffic_light_points,
         'traffic_lane_ids': traffic_lane_ids,
-        'traffic_light_states': traffic_light_states
+        'traffic_light_states': traffic_light_states,
+        'traffic_stop_points': traffic_stop_points
     }
 
 def process_roadgraph(
         scenario,
         traffic_light_data,
         sdc_coord,
-        max_lanes=256,
-        max_roadlines=128,
-        max_static_maps=20,
         num_points_polyline=30,
         num_points_static_map=10,
     ):
@@ -761,9 +751,6 @@ def process_roadgraph(
         scenario: scenario data.
         traffic_light_data: traffic light data.
         sdc_coord: sdc coordinate.
-        max_lanes: maximum number of lanes.
-        max_roadlines: maximum number of roadlines.
-        max_static_maps: maximum number of static maps.
         num_points_polyline: number of points per polyline.
         num_points_static_map: number of points per static map.
         
@@ -778,9 +765,6 @@ def process_roadgraph(
         map_infos,
         traffic_light_data,
         sdc_coord,
-        max_lanes=max_lanes,
-        max_roadlines=max_roadlines,
-        max_static_maps=max_static_maps,
         num_points_polyline=num_points_polyline,
         num_points_static_map=num_points_static_map,
     )
@@ -789,43 +773,21 @@ def process_roadgraph(
     lanes_valid = map_data['lanes_valid']
     lanes_speed_limit = map_data['lanes_speed_limit']
     lanes_has_speed_limit = map_data['lanes_has_speed_limit']
+    lanes_stop_point = map_data['lanes_stop_point']
     
     roadlines = map_data['roadlines']
     roadlines_valid = map_data['roadlines_valid']
     static_maps = map_data['static_maps']
     static_maps_valid = map_data['static_maps_valid']
 
-    # post-process polylines
-    if lanes.shape[0] >= max_lanes:
-        lanes = lanes[:max_lanes]
-        lanes_valid = lanes_valid[:max_lanes]
-        lanes_speed_limit = lanes_speed_limit[:max_lanes]
-        lanes_has_speed_limit = lanes_has_speed_limit[:max_lanes]
-    else:
-        lanes = np.pad(lanes, ((0, max_lanes-lanes.shape[0]), (0, 0), (0, 0)))
-        lanes_valid = np.pad(lanes_valid, (0, max_lanes-lanes_valid.shape[0]))
-        lanes_speed_limit = np.pad(lanes_speed_limit, (0, max_lanes-lanes_speed_limit.shape[0]))
-        lanes_has_speed_limit = np.pad(lanes_has_speed_limit, (0, max_lanes-lanes_has_speed_limit.shape[0]))
-    
-    if roadlines.shape[0] >= max_roadlines:
-        roadlines = roadlines[:max_roadlines]
-        roadlines_valid = roadlines_valid[:max_roadlines]
-    else:
-        roadlines = np.pad(roadlines, ((0, max_roadlines-roadlines.shape[0]), (0, 0), (0, 0)))
-        roadlines_valid = np.pad(roadlines_valid, (0, max_roadlines-roadlines_valid.shape[0]))
-    
-    if static_maps.shape[0] >= max_static_maps:
-        static_maps = static_maps[:max_static_maps]
-        static_maps_valid = static_maps_valid[:max_static_maps]
-    else:
-        static_maps = np.pad(static_maps, ((0, max_static_maps-static_maps.shape[0]), (0, 0), (0, 0)))
-        static_maps_valid = np.pad(static_maps_valid, (0, max_static_maps-static_maps_valid.shape[0]))
+    # Truncation/padding deferred to data loading (collate_fn)
 
     return {
         'lanes': lanes,  # [num_lanes, num_points_polyline, 6]
         'lanes_valid': lanes_valid,  # [num_lanes,]
         'lanes_speed_limit': lanes_speed_limit,  # [num_lanes,]
         'lanes_has_speed_limit': lanes_has_speed_limit,  # [num_lanes,]
+        'lanes_stop_point': lanes_stop_point,  # [num_lanes, 2]
         'roadlines': roadlines,  # [num_roadlines, num_points_polyline, 5]
         'roadlines_valid': roadlines_valid,  # [num_roadlines,]
         'static_maps': static_maps,  # [num_static_maps, num_points_static_map, 5]
@@ -836,9 +798,6 @@ def process_roadgraph(
 def data_process_scenario(
         scenario: scenario_pb2.Scenario,
         max_num_objects: int=64,
-        max_lanes: int=256,
-        max_roadlines: int=128,
-        max_static_maps: int=20,
         current_index: int=10,
         num_points_polyline: int=30,
         num_points_static_map: int=10,
@@ -867,18 +826,14 @@ def data_process_scenario(
     
     traffic_light_data = process_traffic_lights(
         scenario.dynamic_map_states,
-        max_num_traffic_lights=20,
     )
     
     roadgraph_data = process_roadgraph(
         scenario, 
         traffic_light_data, 
         agents_data['sdc_coord'], # sdc position
-        max_lanes=max_lanes,
         num_points_polyline=num_points_polyline,
         num_points_static_map=num_points_static_map,
-        max_roadlines=max_roadlines,
-        max_static_maps=max_static_maps,
     )
 
     # agents_data['history'][..., :6] = transform_coords_to_sdc_frame(agents_data['history'][..., :6], agents_data['sdc_coord'])
@@ -895,6 +850,7 @@ def data_process_scenario(
         'lanes_valid': roadgraph_data['lanes_valid'],
         'lanes_speed_limit': roadgraph_data['lanes_speed_limit'],
         'lanes_has_speed_limit': roadgraph_data['lanes_has_speed_limit'],
+        'lanes_stop_point': roadgraph_data['lanes_stop_point'],
         'roadlines': roadgraph_data['roadlines'],
         'roadlines_valid': roadgraph_data['roadlines_valid'],
         'static_maps': roadgraph_data['static_maps'],
@@ -922,9 +878,6 @@ def wm2dp(
         data_dict = data_process_scenario(
             scenario,
             max_num_objects=MAX_NUM_OBJECTS,
-            max_lanes=MAX_LANES,
-            max_roadlines=MAX_ROADLINES,
-            max_static_maps=MAX_STATIC_MAPS,
             current_index=CURRENT_INDEX,
             num_points_polyline=NUM_POINTS_POLYLINE,
             num_points_static_map=NUM_POINTS_STATIC_MAP,
@@ -945,7 +898,7 @@ def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
 
     input_dir = Path(input_dir) / split
     packages = sorted([p.as_posix() for p in input_dir.glob("*")])
-    packages = packages[:5]
+    packages = packages[:200]
 
     func = partial(
         wm2dp,

@@ -1,11 +1,19 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_cluster import knn
 
 from src.dp.model.module.mixer import MixerBlock
 from src.dp.model.module.timm import Mlp, DropPath
 from src.dp.model.module.local_attention import MultiheadAttentionLocal
+from src.dp.model.module.smart_attention import (
+    AttentionLayer,
+    build_batched_anchor_edge_index,
+    build_batched_knn_edge_index,
+    build_batched_radius_edge_index,
+    compute_scenario_edge_radius,
+    gather_smart_anchor_edge_relations,
+    gather_smart_edge_relations,
+)
 from src.dp.utils.train_utils import batch_transform_trajs_to_local_frame, batch_calculate_relations, batch_transform_maps_to_local_frame
 from src.dp.model.module.rel_emb import FourierEmbedding, RelationEncoder
 
@@ -27,6 +35,29 @@ class Encoder(nn.Module):
 
         self.token_num = config.agent_num + config.static_map_num + config.lane_num + config.roadline_num  # + config.traffic_light_num
         self.local_attn_k = getattr(config, 'local_attn_k', 16)
+        self.a2m_attn_k = 100
+        self.a2a_attn_k = 32
+        self.use_adaptive_edge_radius = getattr(
+            config, 'use_adaptive_edge_radius', True
+        )
+        self.adaptive_edge_base_radius_m = getattr(
+            config, 'adaptive_edge_base_radius_m', 10.0
+        )
+        self.adaptive_edge_time_horizon_s = getattr(
+            config, 'adaptive_edge_time_horizon_s', 2.0
+        )
+        self.adaptive_edge_min_radius_m = getattr(
+            config, 'adaptive_edge_min_radius_m', 30.0
+        )
+        self.adaptive_edge_max_radius_m = getattr(
+            config, 'adaptive_edge_max_radius_m', 80.0
+        )
+        if config.hidden_dim % config.num_heads != 0:
+            raise ValueError(
+                f"hidden_dim ({config.hidden_dim}) must be divisible by "
+                f"num_heads ({config.num_heads})"
+            )
+        attention_head_dim = config.hidden_dim // config.num_heads
 
         # self.agents_encoder = AgentFusionEncoder(config.time_len, drop_path_rate=config.encoder_drop_path_rate, hidden_dim=config.hidden_dim, depth=config.encoder_depth)
         self.agents_encoder = AgentEncoder(
@@ -66,6 +97,12 @@ class Encoder(nn.Module):
             hidden_dim=config.hidden_dim,
             num_freq_bands=64
         )
+        self.a2m_relation_fusion = nn.Sequential(
+            nn.Linear(3 * config.hidden_dim, config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(config.hidden_dim, config.hidden_dim),
+        )
 
         self.fusion_m2m = FusionEncoder(
             hidden_dim=config.hidden_dim, 
@@ -86,21 +123,21 @@ class Encoder(nn.Module):
                     device=config.device,
                     rel_encoder=self.rel_encoder,
                 ),
-                'a2m': CrossFusionEncoder(
+                'a2m': AttentionLayer(
                     hidden_dim=config.hidden_dim,
                     num_heads=config.num_heads,
-                    drop_path_rate=config.encoder_drop_path_rate,
-                    depth=1,
-                    device=config.device,
-                    rel_encoder=self.rel_encoder,
+                    head_dim=attention_head_dim,
+                    dropout=config.encoder_drop_path_rate,
+                    bipartite=True,
+                    has_pos_emb=True,
                 ),
-                'a2a': FusionEncoder(
+                'a2a': AttentionLayer(
                     hidden_dim=config.hidden_dim,
                     num_heads=config.num_heads,
-                    drop_path_rate=config.encoder_drop_path_rate,
-                    depth=1,
-                    device=config.device,
-                    rel_encoder=self.rel_encoder,
+                    head_dim=attention_head_dim,
+                    dropout=config.encoder_drop_path_rate,
+                    bipartite=False,
+                    has_pos_emb=True,
                 ),
             })
             for _ in range(config.encoder_depth)
@@ -202,7 +239,30 @@ class Encoder(nn.Module):
         encoding_map_mask = encoding_mask.view(B, -1)[:, map_start:map_end]
         m2m_rel = relations[:, map_start:map_end, :, :][:, :, map_start:map_end]
 
-        dist_m2m = torch.norm(m2m_rel[..., :2], dim=-1)
+        # Represent each complete map element by only three geometric anchors
+        # (start, midpoint, end). Use the minimum pairwise anchor distance as
+        # the map-to-map distance metric, consistent with the a2m anchor logic.
+        def _start_mid_end(map_tensor):
+            point_count = map_tensor.size(2)
+            anchor_index = torch.tensor(
+                [0, point_count // 2, point_count - 1],
+                dtype=torch.long,
+                device=map_tensor.device,
+            )
+            return map_tensor.index_select(2, anchor_index)[..., :4]
+
+        map_anchor_states_full = torch.cat(
+            [
+                _start_mid_end(static_maps),
+                _start_mid_end(lanes),
+                _start_mid_end(roadlines),
+            ],
+            dim=1,
+        )
+        map_anchor_pos = map_anchor_states_full[..., :2]
+        anchor_flat = map_anchor_pos.reshape(B, N_map * 3, 2)
+        dist_all = torch.cdist(anchor_flat, anchor_flat).reshape(B, N_map, 3, N_map, 3)
+        dist_m2m = dist_all.amin(dim=(2, 4))
         dist_m2m = dist_m2m.masked_fill(encoding_map_mask.unsqueeze(1), 1e9)
         _, m2m_index_pair = torch.topk(dist_m2m, k=self.local_attn_k, dim=-1, largest=False)
         m2m_index_pair = m2m_index_pair.reshape(B * N_map, self.local_attn_k)
@@ -210,20 +270,88 @@ class Encoder(nn.Module):
         encoding_map_fused = self.fusion_m2m(encoding_map, encoding_map_mask, m2m_index_pair, m2m_rel)
 
         encoding_agents_mask = encoding_mask.view(B, -1)[:, :n_agents]
-        a2m_rel = relations[:, :n_agents, :, :][:, :, map_start:map_end]
+        scenario_radius = None
+        if self.use_adaptive_edge_radius:
+            scenario_radius = compute_scenario_edge_radius(
+                speed_limit_mph=lanes_speed_limit,
+                has_speed_limit=lanes_has_speed_limit,
+                lane_mask=lanes_mask,
+                base_radius_m=self.adaptive_edge_base_radius_m,
+                time_horizon_s=self.adaptive_edge_time_horizon_s,
+                min_radius_m=self.adaptive_edge_min_radius_m,
+                max_radius_m=self.adaptive_edge_max_radius_m,
+            )
 
-        dist_a2m = torch.norm(a2m_rel[..., :2], dim=-1)
-        dist_a2m = dist_a2m.masked_fill(encoding_agents_mask.unsqueeze(-1), 1e9)
-        dist_a2m = dist_a2m.masked_fill(encoding_map_mask.unsqueeze(1), 1e9)
-        _, a2m_index_pair = torch.topk(dist_a2m, k=32, dim=-1, largest=False)
-        a2m_index_pair = a2m_index_pair.reshape(B * n_agents, 32)
+        # Compact valid nodes before graph construction so padded tokens cannot
+        # become either message sources or destinations.
+        agent_nodes = torch.nonzero(~encoding_agents_mask, as_tuple=False)
+        map_nodes_local = torch.nonzero(~encoding_map_mask, as_tuple=False)
+        map_nodes = map_nodes_local.clone()
+        map_nodes[:, 1] += map_start
 
-        a2a_rel = relations[:, :n_agents, :, :][:, :, :n_agents]
+        agent_states = all_elements[
+            agent_nodes[:, 0], agent_nodes[:, 1], :4
+        ]
+        agent_positions = agent_states[:, :2]
 
-        a2a_dist = torch.norm(a2a_rel[..., :2], dim=-1)
-        a2a_dist = a2a_dist.masked_fill(encoding_agents_mask.unsqueeze(1), 1e9)
-        _, a2a_index_pair = torch.topk(a2a_dist, k=self.local_attn_k, dim=-1, largest=False)
-        a2a_index_pair = a2a_index_pair.reshape(B * n_agents, self.local_attn_k)
+        map_anchor_states = map_anchor_states_full[~encoding_map_mask]
+
+        if scenario_radius is not None:
+            a2m_edge_index = build_batched_anchor_edge_index(
+                source_anchor_positions=map_anchor_states[..., :2],
+                target_positions=agent_positions,
+                source_batch=map_nodes[:, 0],
+                target_batch=agent_nodes[:, 0],
+                batch_radius=scenario_radius,
+                max_num_neighbors=self.a2m_attn_k,
+            )
+            a2a_edge_index = build_batched_radius_edge_index(
+                source_positions=agent_positions,
+                target_positions=agent_positions,
+                source_batch=agent_nodes[:, 0],
+                target_batch=agent_nodes[:, 0],
+                batch_radius=scenario_radius,
+                max_num_neighbors=self.a2a_attn_k,
+                exclude_self=True,
+            )
+        else:
+            a2m_edge_index = build_batched_anchor_edge_index(
+                source_anchor_positions=map_anchor_states[..., :2],
+                target_positions=agent_positions,
+                source_batch=map_nodes[:, 0],
+                target_batch=agent_nodes[:, 0],
+                max_num_neighbors=self.a2m_attn_k,
+            )
+            a2a_edge_index = build_batched_knn_edge_index(
+                source_positions=agent_positions,
+                target_positions=agent_positions,
+                source_batch=agent_nodes[:, 0],
+                target_batch=agent_nodes[:, 0],
+                k=self.local_attn_k,
+                exclude_self=True,
+            )
+
+        # The planner relation matrix is target-first (target - source), while
+        # SMART messages use source-to-target geometry in the target frame.
+        a2m_anchor_rel = gather_smart_anchor_edge_relations(
+            source_anchor_states=map_anchor_states,
+            target_states=agent_states,
+            source_batch=map_nodes[:, 0],
+            target_batch=agent_nodes[:, 0],
+            edge_index=a2m_edge_index,
+        )
+        a2a_edge_rel = gather_smart_edge_relations(
+            relations=relations,
+            source_nodes=agent_nodes,
+            target_nodes=agent_nodes,
+            edge_index=a2a_edge_index,
+        )
+        a2m_anchor_embedding = self.rel_encoder(a2m_anchor_rel)
+        a2m_edge_embedding = self.a2m_relation_fusion(
+            a2m_anchor_embedding.flatten(start_dim=1)
+        )
+        a2a_edge_embedding = self.rel_encoder(a2a_edge_rel)
+        encoding_map_valid = encoding_map_fused[~encoding_map_mask]
 
         V = encoding_agents_t.shape[2]
         a2h_kv = encoding_agents_t.reshape(B, n_agents * V, -1)
@@ -248,14 +376,22 @@ class Encoder(nn.Module):
                 a2h_index_pair, a2h_rel,
                 self_rel_mask=a2h_self_rel_mask
             )
-            encoding_agents = layer['a2m'](
-                encoding_agents, encoding_map_fused,
-                encoding_agents_mask, encoding_map_mask,
-                a2m_index_pair, a2m_rel
-            )
-            encoding_agents = layer['a2a'](
-                encoding_agents, encoding_agents_mask, a2a_index_pair, a2a_rel
-            )
+            encoding_agents_valid = encoding_agents[~encoding_agents_mask]
+            if encoding_agents_valid.size(0) > 0:
+                encoding_agents_valid = layer['a2m'](
+                    (encoding_map_valid, encoding_agents_valid),
+                    a2m_edge_embedding,
+                    a2m_edge_index,
+                )
+                encoding_agents_valid = layer['a2a'](
+                    encoding_agents_valid,
+                    a2a_edge_embedding,
+                    a2a_edge_index,
+                )
+                encoding_agents = torch.zeros_like(encoding_agents).index_put(
+                    (agent_nodes[:, 0], agent_nodes[:, 1]),
+                    encoding_agents_valid,
+                )
 
 
         encoding_fused = torch.cat([
@@ -589,17 +725,6 @@ class AgentEncoder(nn.Module):
         x_raw = x                                     # [N, V, 9] save raw for temporal relation computation
         N = x.shape[0]
 
-        if N == 0:
-            x_res = torch.zeros(B * P, self._hidden_dim, device=x.device)
-            x_res = torch.zeros(B * P, V, self._hidden_dim, device=x.device)
-            mask_t = torch.ones(B * P, V, dtype=torch.bool, device=x.device)
-            a2h_rel = torch.zeros(B * P, V, 4, device=x.device)
-            return (x_res.view(B, P, V, -1),
-                    x_res.view(B, P, -1),
-                    mask_t.view(B, P, V),
-                    a2h_rel.view(B, P, V, -1),
-                    mask_p.reshape(B, -1))
-
         motion = x_raw[:, 1:, :2] - x_raw[:, :-1, :2]
         motion = torch.cat([x_raw[:, :1, 4:6], motion], dim=1)
         vel = x_raw[..., 4:6]
@@ -810,7 +935,7 @@ class LaneFusionEncoder(nn.Module):
             input_dim=1, hidden_dim=channels_mlp_dim, num_freq_bands=16
         )
         self.unknown_speed_emb = nn.Embedding(1, channels_mlp_dim)
-        self.traffic_emb = nn.Embedding(9, channels_mlp_dim)
+        self.tl_emb = nn.Embedding(9, channels_mlp_dim)
         self.type_emb = nn.Embedding(4, channels_mlp_dim)
         self.stop_point_emb = FourierEmbedding(
             input_dim=2, hidden_dim=channels_mlp_dim, num_freq_bands=32
@@ -832,7 +957,7 @@ class LaneFusionEncoder(nn.Module):
         self.norm = nn.LayerNorm(channels_mlp_dim)
         self.emb_project = Mlp(
             in_features=channels_mlp_dim, hidden_features=hidden_dim,
-            out_features=channels_mlp_dim, act_layer=nn.GELU, drop=drop_path_rate
+            out_features=hidden_dim, act_layer=nn.GELU, drop=drop_path_rate
         )
 
     def forward(self, x, stop_point, speed_limit, has_speed_limit):
@@ -883,13 +1008,14 @@ class LaneFusionEncoder(nn.Module):
         # === Late fusion: traffic and stop_point (after attention) ===
         traffic = traffic.long().view(B * P)
         traffic = traffic[valid_indices]
-        traffic_light_embedding = self.traffic_emb(traffic)
+        tl_embedding = self.tl_emb(traffic)
 
         stop_point = stop_point.view(B * P, 2)
         stop_point = stop_point[valid_indices]
         stop_point_embedding = self.stop_point_emb(stop_point)
 
-        x = x + self.emb_project(self.norm(traffic_light_embedding + stop_point_embedding))
+        x = x + tl_embedding + stop_point_embedding
+        x = self.emb_project(self.norm(x))
 
         x_result = torch.zeros((B * P, x.shape[-1]), device=x.device)
         x_result[valid_indices] = x  # Fill in valid parts

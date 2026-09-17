@@ -1,22 +1,23 @@
 # @package _global_
 
 defaults:
-  # - override /trainer: ddp
+  - override /trainer: ddp
   - override /model: dp
 
 trainer:
-  max_epochs: 64
+  max_epochs: 32
   limit_train_batches: 1.0
   limit_val_batches: 1.0
   limit_test_batches: 1.0
 
 data:
   val_gt_scenario_dir: null
-  train_batch_size: 24
-  val_batch_size: 32
+  train_batch_size: 28
+  val_batch_size: 28
 
 model:
   config:
+    learning_rate: 5e-4
     train_predictor: false
     val_closed_loop: false
     fast_wosac_metric: false

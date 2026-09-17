@@ -97,6 +97,7 @@ class DPDataset(Dataset):
         lanes_valid = data['lanes_valid']
         lanes_speed_limit = data['lanes_speed_limit']
         lanes_has_speed_limit = data['lanes_has_speed_limit']
+        lanes_stop_point = data['lanes_stop_point']
         roadlines = data['roadlines']
         roadlines_valid = data['roadlines_valid']
         static_maps = data['static_maps']
@@ -118,6 +119,7 @@ class DPDataset(Dataset):
             "lanes_valid": torch.from_numpy(lanes_valid),
             "lanes_speed_limit": torch.from_numpy(lanes_speed_limit),
             "lanes_has_speed_limit": torch.from_numpy(lanes_has_speed_limit),
+            "lanes_stop_point": torch.from_numpy(lanes_stop_point),
             "roadlines": torch.from_numpy(roadlines),
             "roadlines_valid": torch.from_numpy(roadlines_valid),
             "static_maps": torch.from_numpy(static_maps),

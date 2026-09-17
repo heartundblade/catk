@@ -558,7 +558,7 @@ class LocalDiTBlock(nn.Module):
 
 #         return x
 
-class ChunkAggregator(nn.Module):
+class ChunkEmbbeder(nn.Module):
     """VectorMapBackbone-style chunk aggregator for action sequences.
     
     point_mlp: per-point feature extraction (O(S) complexity)
@@ -567,7 +567,7 @@ class ChunkAggregator(nn.Module):
     Replaces bidirectional GRU with a fully parallel, lightweight design
     adapted from the VectorMapBackbone in encoder.py.
     """
-    def __init__(self, hidden_dim=192, num_heads=4, dropout=0.1):
+    def __init__(self, hidden_dim=192, num_heads=4, dropout=0.1, chunk_size=None):
         super().__init__()
         self.point_mlp = nn.Sequential(
             nn.LayerNorm(hidden_dim),
@@ -579,6 +579,10 @@ class ChunkAggregator(nn.Module):
             hidden_dim, num_heads, dropout=dropout, batch_first=True
         )
         self.attn_norm = nn.LayerNorm(hidden_dim)
+        if chunk_size is not None:
+            self.step_pos_embed = nn.Parameter(torch.zeros(1, chunk_size, hidden_dim))
+        else:
+            self.step_pos_embed = None
 
     def forward(self, x):
         """
@@ -588,6 +592,8 @@ class ChunkAggregator(nn.Module):
             [N, D]  aggregated chunk feature
         """
         x = self.point_mlp(x)                # [N, S, D]
+        if self.step_pos_embed is not None:
+            x = x + self.step_pos_embed
         N = x.shape[0]
         q = self.query_token.expand(N, -1, -1)  # [N, 1, D]
         x, _ = self.attn_pool(q, x, x)       # [N, 1, D]
@@ -598,7 +604,7 @@ class RefineBlock(nn.Module):
     """
     Intra-chunk self-attention refinement block with agent adaLN modulation.
     """
-    def __init__(self, dim, heads, dropout=0.1):
+    def __init__(self, dim, heads, dropout=0.1, chunk_size=None):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
@@ -608,6 +614,10 @@ class RefineBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(dim, 2 * dim, bias=True)
         )
+        if chunk_size is not None:
+            self.step_pos_embed = nn.Parameter(torch.zeros(1, chunk_size, dim))
+        else:
+            self.step_pos_embed = None
 
     def forward(self, x, agent_ctx):
         """
@@ -621,6 +631,8 @@ class RefineBlock(nn.Module):
         x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
         h = self.norm1(x)
+        if self.step_pos_embed is not None:
+            h = h + self.step_pos_embed
         h = self.attn(h, h, h)[0]
         x = x + h
         h = self.norm2(x)
@@ -630,32 +642,18 @@ class RefineBlock(nn.Module):
 class FinalLayer(nn.Module):
     """
     The final layer of DiT.
-    Each chunk has its own output head to prevent gradient concentration
-    from all temporal segments onto a single weight matrix.
+    A single shared head for all chunks.
     """
     def __init__(self, hidden_size, output_size, num_chunks=1):
         super().__init__()
         self.num_chunks = num_chunks
-        self.heads = nn.ModuleList([
-            nn.Sequential(
-                nn.LayerNorm(hidden_size),
-                nn.Linear(hidden_size, hidden_size // 2, bias=True),
-                nn.GELU(approximate="tanh"),
-                nn.Dropout(0.1),
-                nn.Linear(hidden_size // 2, output_size, bias=True)
-            )
-            for _ in range(num_chunks)
-        ])
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size // 2, bias=True),
+            nn.GELU(approximate="tanh"),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size // 2, output_size, bias=True)
+        )
 
     def forward(self, x):
-        # x: [N, S, D] where N = B*P*C
-        N, S, D = x.shape
-        C = self.num_chunks
-        x = x.reshape(N // C, C, S, D)
-        chunk_outputs = []
-        for i in range(C):
-            chunk_out = self.heads[i](x[:, i])  # [N/C, S, O]
-            chunk_outputs.append(chunk_out)
-        x = torch.stack(chunk_outputs, dim=1)   # [N/C, C, S, O]
-        x = x.reshape(N, S, -1)                 # [N, S, O]
-        return x
+        return self.head(x)

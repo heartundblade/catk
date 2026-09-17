@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 class MultiheadAttentionLocal(nn.Module):
 
-    def __init__(self, embed_dim, num_heads, dropout=0.0, use_key_gate=True):
+    def __init__(self, embed_dim, num_heads, dropout=0.0, use_key_gate=False):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
