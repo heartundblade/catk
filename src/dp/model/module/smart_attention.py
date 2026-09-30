@@ -13,7 +13,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from torch_cluster import knn, radius
+from torch_cluster import knn, radius, radius_graph
 from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.utils import softmax
 
@@ -178,7 +178,7 @@ def compute_scenario_edge_radius(
     lane_mask: torch.Tensor,
     base_radius_m: float = 10.0,
     time_horizon_s: float = 2.0,
-    min_radius_m: float = 30.0,
+    min_radius_m: float = 20.0,
     max_radius_m: float = 80.0,
 ) -> torch.Tensor:
     """Compute one bounded interaction radius per scenario.
@@ -311,6 +311,35 @@ def build_batched_knn_edge_index(
     if not edge_parts:
         return torch.empty((2, 0), dtype=torch.long, device=device)
     return torch.cat(edge_parts, dim=1)
+
+
+def build_batched_map_radius_graph(
+    positions: torch.Tensor,
+    batch: torch.Tensor,
+    radius_m: float,
+    max_num_neighbors: int,
+) -> torch.Tensor:
+    """Build m2m edges in one radius_graph call, as in SMART.
+
+    ``batch`` is sorted by scenario because packed map collation concatenates
+    each scenario's tokens. The returned rows are source and target indices.
+    """
+    if positions.ndim != 2 or positions.size(-1) != 2:
+        raise ValueError("map positions must have shape [M, 2]")
+    if batch.numel() != positions.size(0):
+        raise ValueError("map_batch must contain one id per map token")
+    if radius_m <= 0 or max_num_neighbors <= 0:
+        raise ValueError("radius_m and max_num_neighbors must be positive")
+    if positions.size(0) == 0:
+        return torch.empty((2, 0), dtype=torch.long, device=positions.device)
+    return radius_graph(
+        x=positions,
+        r=radius_m,
+        batch=batch,
+        loop=False,
+        max_num_neighbors=max_num_neighbors,
+        flow="source_to_target",
+    )
 
 
 def build_batched_radius_edge_index(
@@ -580,6 +609,7 @@ __all__ = [
     "AttentionLayer",
     "build_batched_anchor_edge_index",
     "build_batched_knn_edge_index",
+    "build_batched_map_radius_graph",
     "build_batched_radius_edge_index",
     "compute_scenario_edge_radius",
     "gather_smart_anchor_edge_relations",

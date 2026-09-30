@@ -612,7 +612,7 @@ class RefineBlock(nn.Module):
         self.ffn = Mlp(dim, dim * 4, dim, act_layer=nn.GELU, drop=0.)
         self.agent_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(dim, 2 * dim, bias=True)
+            nn.Linear(dim, 3 * dim, bias=True)
         )
         if chunk_size is not None:
             self.step_pos_embed = nn.Parameter(torch.zeros(1, chunk_size, dim))
@@ -627,8 +627,8 @@ class RefineBlock(nn.Module):
         Returns:
             x: [B, S, D]
         """
-        shift, scale = self.agent_modulation(agent_ctx).chunk(2, dim=-1)  # [B, D] each
-        x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        shift, scale, gate = self.agent_modulation(agent_ctx).chunk(3, dim=-1)  # [B, D] each
+        x = x * (1 + scale.unsqueeze(1) * gate.sigmoid().unsqueeze(1)) + shift.unsqueeze(1)
 
         h = self.norm1(x)
         if self.step_pos_embed is not None:

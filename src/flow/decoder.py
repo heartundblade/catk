@@ -179,7 +179,7 @@ class DiT(nn.Module):
         ):
         super().__init__()
         
-        assert model_type in ["score", "x_start", "noise"], f"Unknown model type: {model_type}"
+        assert model_type in ["score", "x_start", "noise", "velocity"], f"Unknown model type: {model_type}"
         self._model_type = model_type
         self._agent_num = agent_num
         self._action_dim = action_dim
@@ -378,7 +378,7 @@ class DiT(nn.Module):
             return output / (self.marginal_prob_std(t)[:, None, None] + 1e-6)
         elif self._model_type == "x_start":
             return output
-        elif self._model_type == "noise":
+        elif self._model_type in ("noise", "velocity"):
             return output
         else:
             raise ValueError(f"Unknown model type: {self._model_type}")

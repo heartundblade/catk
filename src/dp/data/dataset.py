@@ -86,6 +86,13 @@ class DPDataset(Dataset):
         Returns:
             torch tensor dictionary.
         """
+        schema_version = int(np.asarray(data.get('map_schema_version', -1)))
+        if schema_version != 9:
+            raise RuntimeError(
+                f"Unsupported map cache schema {schema_version}; expected version 9. "
+                "Regenerate the train, validation, and test caches with the "
+                "three-point continuous SMART-style map preprocessor."
+            )
         sdc_coord = data['sdc_coord']
         agents_history = data['agents_history']
         agents_interested = data['agents_interested']
@@ -93,15 +100,6 @@ class DPDataset(Dataset):
         agents_future_valid = data['agents_future_valid']
         agents_type = data['agents_type']
         traffic_light_points = data['traffic_light_points']
-        lanes = data['lanes']
-        lanes_valid = data['lanes_valid']
-        lanes_speed_limit = data['lanes_speed_limit']
-        lanes_has_speed_limit = data['lanes_has_speed_limit']
-        lanes_stop_point = data['lanes_stop_point']
-        roadlines = data['roadlines']
-        roadlines_valid = data['roadlines_valid']
-        static_maps = data['static_maps']
-        static_maps_valid = data['static_maps_valid']
         agents_id = data['agents_id']
         agents_history_remaining = data['agents_history_remaining']
         agents_id_remaining = data['agents_id_remaining']
@@ -115,15 +113,16 @@ class DPDataset(Dataset):
             "agents_future_valid": torch.from_numpy(agents_future_valid),
             "agents_type": torch.from_numpy(agents_type),
             "traffic_light_points": torch.from_numpy(traffic_light_points),
-            "lanes": torch.from_numpy(lanes),
-            "lanes_valid": torch.from_numpy(lanes_valid),
-            "lanes_speed_limit": torch.from_numpy(lanes_speed_limit),
-            "lanes_has_speed_limit": torch.from_numpy(lanes_has_speed_limit),
-            "lanes_stop_point": torch.from_numpy(lanes_stop_point),
-            "roadlines": torch.from_numpy(roadlines),
-            "roadlines_valid": torch.from_numpy(roadlines_valid),
-            "static_maps": torch.from_numpy(static_maps),
-            "static_maps_valid": torch.from_numpy(static_maps_valid),
+            "map_geometry": torch.from_numpy(data['map_geometry']),
+            "map_type": torch.from_numpy(data['map_type']),
+            "map_light_type": torch.from_numpy(data['map_light_type']),
+            "map_stop_point": torch.from_numpy(data['map_stop_point']),
+            "map_has_stop_point": torch.from_numpy(data['map_has_stop_point']),
+            "map_speed_limit": torch.from_numpy(data['map_speed_limit']),
+            "map_has_speed_limit": torch.from_numpy(data['map_has_speed_limit']),
+            "map_parent_id": torch.from_numpy(data['map_parent_id']),
+            "map_segment_index": torch.from_numpy(data['map_segment_index']),
+            "map_schema_version": torch.tensor(schema_version, dtype=torch.int32),
             "anchors": torch.from_numpy(anchors),
             'agents_id': torch.from_numpy(agents_id),
             'agents_history_remaining': torch.from_numpy(agents_history_remaining),

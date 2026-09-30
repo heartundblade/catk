@@ -62,10 +62,11 @@ class Encoder(nn.Module):
 
         # self.traffic_light_encoder = TrafficLightEncoder(config.hidden_dim)
 
-        self.rel_encoder = rel_encoder if rel_encoder is not None else RelationEncoder(
-            hidden_dim=config.hidden_dim,
-            num_freq_bands=64
-        )
+        _rel_kwargs = dict(hidden_dim=config.hidden_dim, num_freq_bands=64)
+        self.rel_encoder_m2m = RelationEncoder(**_rel_kwargs)
+        self.rel_encoder_a2h = RelationEncoder(**_rel_kwargs)
+        self.rel_encoder_a2m = RelationEncoder(**_rel_kwargs)
+        self.rel_encoder_a2a = RelationEncoder(**_rel_kwargs)
 
         self.fusion_m2m = FusionEncoder(
             hidden_dim=config.hidden_dim, 
@@ -73,7 +74,7 @@ class Encoder(nn.Module):
             drop_path_rate=config.encoder_drop_path_rate, 
             depth=1, 
             device=config.device,
-            rel_encoder=self.rel_encoder,
+            rel_encoder=self.rel_encoder_m2m,
         )
 
         self.fusion_layers = nn.ModuleList([
@@ -84,7 +85,7 @@ class Encoder(nn.Module):
                     drop_path_rate=config.encoder_drop_path_rate,
                     depth=1,
                     device=config.device,
-                    rel_encoder=self.rel_encoder,
+                    rel_encoder=self.rel_encoder_a2h,
                 ),
                 'a2m': CrossFusionEncoder(
                     hidden_dim=config.hidden_dim,
@@ -92,7 +93,7 @@ class Encoder(nn.Module):
                     drop_path_rate=config.encoder_drop_path_rate,
                     depth=1,
                     device=config.device,
-                    rel_encoder=self.rel_encoder,
+                    rel_encoder=self.rel_encoder_a2m,
                 ),
                 'a2a': FusionEncoder(
                     hidden_dim=config.hidden_dim,
@@ -100,7 +101,7 @@ class Encoder(nn.Module):
                     drop_path_rate=config.encoder_drop_path_rate,
                     depth=1,
                     device=config.device,
-                    rel_encoder=self.rel_encoder,
+                    rel_encoder=self.rel_encoder_a2a,
                 ),
             })
             for _ in range(config.encoder_depth)
@@ -150,7 +151,7 @@ class Encoder(nn.Module):
         lanes_local = batch_transform_maps_to_local_frame(lanes)
 
         # Transform lanes_stop_point to the same local frame as lanes
-        ref_idx = lanes.shape[2] // 2
+        ref_idx = 0
         ref_x = lanes[:, :, ref_idx, 0]
         ref_y = lanes[:, :, ref_idx, 1]
         ref_cos = lanes[:, :, ref_idx, 2]

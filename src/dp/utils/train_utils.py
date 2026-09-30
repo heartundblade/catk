@@ -81,6 +81,38 @@ def transform_coords_to_sdc_frame(coords, sdc_states):
     
     return transformed
 
+
+def transform_packed_map_to_sdc_frame(map_geometry, sdc_states, map_batch):
+    """Transform packed ``[M, 3, 3]`` (x, y, heading) into the SDC frame."""
+    if map_geometry.shape[0] == 0:
+        return map_geometry.clone()
+    token_sdc = sdc_states[map_batch]
+    theta = token_sdc[:, 2]
+    cos_theta, sin_theta = torch.cos(theta), torch.sin(theta)
+    dx = map_geometry[..., 0] - token_sdc[:, None, 0]
+    dy = map_geometry[..., 1] - token_sdc[:, None, 1]
+    candidate = map_geometry.clone()
+    candidate[..., 0] = dx * cos_theta[:, None] + dy * sin_theta[:, None]
+    candidate[..., 1] = -dx * sin_theta[:, None] + dy * cos_theta[:, None]
+    candidate[..., 2] = wrap_angle(map_geometry[..., 2] - theta[:, None])
+    return candidate
+
+
+def packed_map_to_dense(features, map_ptr, batch_size):
+    """Convert packed map features to decoder context plus a padding mask."""
+    counts = map_ptr[1:] - map_ptr[:-1]
+    max_count = int(counts.max().item()) if counts.numel() else 0
+    dense = features.new_zeros((batch_size, max_count, features.size(-1)))
+    mask = torch.ones((batch_size, max_count), dtype=torch.bool, device=features.device)
+    for batch_index in range(batch_size):
+        start = int(map_ptr[batch_index].item())
+        end = int(map_ptr[batch_index + 1].item())
+        count = end - start
+        if count:
+            dense[batch_index, :count] = features[start:end]
+            mask[batch_index, :count] = False
+    return dense, mask
+
 def transform_coords_to_global_frame(coords, sdc_states):
     """
     Batch transform coordinates from the SDC frame of reference to global frame.

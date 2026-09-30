@@ -93,10 +93,11 @@ class Encoder(nn.Module):
 
         # self.traffic_light_encoder = TrafficLightEncoder(config.hidden_dim)
 
-        self.rel_encoder = rel_encoder if rel_encoder is not None else RelationEncoder(
-            hidden_dim=config.hidden_dim,
-            num_freq_bands=64
-        )
+        _rel_kwargs = dict(hidden_dim=config.hidden_dim, num_freq_bands=64)
+        self.rel_encoder_m2m = RelationEncoder(**_rel_kwargs)
+        self.rel_encoder_a2h = RelationEncoder(**_rel_kwargs)
+        self.rel_encoder_a2m = RelationEncoder(**_rel_kwargs)
+        self.rel_encoder_a2a = RelationEncoder(**_rel_kwargs)
         self.a2m_relation_fusion = nn.Sequential(
             nn.Linear(3 * config.hidden_dim, config.hidden_dim),
             nn.LayerNorm(config.hidden_dim),
@@ -110,7 +111,7 @@ class Encoder(nn.Module):
             drop_path_rate=config.encoder_drop_path_rate, 
             depth=1, 
             device=config.device,
-            rel_encoder=self.rel_encoder,
+            rel_encoder=self.rel_encoder_m2m,
         )
 
         self.fusion_layers = nn.ModuleList([
@@ -121,7 +122,7 @@ class Encoder(nn.Module):
                     drop_path_rate=config.encoder_drop_path_rate,
                     depth=1,
                     device=config.device,
-                    rel_encoder=self.rel_encoder,
+                    rel_encoder=self.rel_encoder_a2h,
                 ),
                 'a2m': AttentionLayer(
                     hidden_dim=config.hidden_dim,
@@ -187,7 +188,7 @@ class Encoder(nn.Module):
         lanes_local = batch_transform_maps_to_local_frame(lanes)
 
         # Transform lanes_stop_point to the same local frame as lanes
-        ref_idx = lanes.shape[2] // 2
+        ref_idx = 0
         ref_x = lanes[:, :, ref_idx, 0]
         ref_y = lanes[:, :, ref_idx, 1]
         ref_cos = lanes[:, :, ref_idx, 2]
@@ -237,7 +238,14 @@ class Encoder(nn.Module):
 
         encoding_map = encoding_input[:, map_start:map_end, :]
         encoding_map_mask = encoding_mask.view(B, -1)[:, map_start:map_end]
+        # relations[i,j] = elem_i - elem_j in elem_i's frame (query-key).
+        # Flip to key-query (elem_j - elem_i in elem_i's frame) to match
+        # a2a / a2m conventions.
         m2m_rel = relations[:, map_start:map_end, :, :][:, :, map_start:map_end]
+        m2m_rel = torch.stack(
+            [-m2m_rel[..., 0], -m2m_rel[..., 1], m2m_rel[..., 2], -m2m_rel[..., 3]],
+            dim=-1,
+        )
 
         # Represent each complete map element by only three geometric anchors
         # (start, midpoint, end). Use the minimum pairwise anchor distance as
@@ -346,11 +354,11 @@ class Encoder(nn.Module):
             target_nodes=agent_nodes,
             edge_index=a2a_edge_index,
         )
-        a2m_anchor_embedding = self.rel_encoder(a2m_anchor_rel)
+        a2m_anchor_embedding = self.rel_encoder_a2m(a2m_anchor_rel)
         a2m_edge_embedding = self.a2m_relation_fusion(
             a2m_anchor_embedding.flatten(start_dim=1)
         )
-        a2a_edge_embedding = self.rel_encoder(a2a_edge_rel)
+        a2a_edge_embedding = self.rel_encoder_a2a(a2a_edge_rel)
         encoding_map_valid = encoding_map_fused[~encoding_map_mask]
 
         V = encoding_agents_t.shape[2]
@@ -399,12 +407,17 @@ class Encoder(nn.Module):
             encoding_map_fused,
         ], dim=1)
         
-        # # ---- DEBUG: 保存 index_pair 数据到文件，确认后删除 ----
-        # debug_index_pair(index_pair, all_elements, encoding_mask, B, N, self.local_attn_k,
-        #                  n_agents=64, n_static=20,
-        #                  n_lanes=256, n_roadlines=128,
-        #                  n_traffic_lights=20)
-        # # ---- DEBUG END ----
+        # ---- DEBUG: 保存 index_pair (m2m + a2m) 数据到文件 ----
+        # N_total = n_agents + n_static + n_lanes + n_roadlines
+        # debug_index_pair(
+        #     m2m_index_pair, all_elements, encoding_mask, B, N_total,
+        #     self.local_attn_k,
+        #     n_agents=n_agents, n_static=n_static,
+        #     n_lanes=n_lanes, n_roadlines=n_roadlines,
+        #     a2m_edge_index=a2m_edge_index,
+        #     agent_nodes=agent_nodes,
+        #     map_nodes=map_nodes,
+        # )
 
         encoder_outputs['encoding'] = encoding_fused
         # encoder_outputs['encoding'] = encoding_input
@@ -415,10 +428,16 @@ class Encoder(nn.Module):
 
 def debug_index_pair(index_pair, all_elements, encoding_mask, B, N, local_attn_k,
                      n_agents, n_static, n_lanes, n_roadlines, n_traffic_lights=0,
+                     a2m_edge_index=None, agent_nodes=None, map_nodes=None,
                      save_dir='/home/zhanghailiang/Repos/catk/logs/debug_index_pair'):
     """
-    将 index_pair 和 token 位置保存到 .npz 文件，方便离线可视化。
-    同时打印统计信息，无需 matplotlib 也能判断邻居选择是否合理。
+    将 m2m (map-to-map) 和 a2m (agent-to-map) 的 index pair 保存到 .npz 文件。
+
+    Args:
+        index_pair: [B*N_map, L] m2m 邻居索引（局部 map 索引 0~N_map-1）
+        a2m_edge_index: [2, E] a2m 边（compact valid 空间，source=map, target=agent）
+        agent_nodes: [num_valid_agents, 2] (batch_idx, token_idx)
+        map_nodes: [num_valid_map, 2] (batch_idx, token_idx), 全局索引（含 map_start 偏移）
     """
     import numpy as np
     import os
@@ -426,12 +445,49 @@ def debug_index_pair(index_pair, all_elements, encoding_mask, B, N, local_attn_k
     os.makedirs(save_dir, exist_ok=True)
 
     # ---- 保存核心数据 ----
-    pos = all_elements[0, :, :2].cpu().numpy()          # [N, 2] x, y
-    cos_sin = all_elements[0, :, 2:4].cpu().numpy()     # [N, 2] cos, sin
-    mask = encoding_mask.view(B, N)[0].cpu().numpy()     # [N] True=invalid
-    ip = index_pair[:N].cpu().numpy()                    # [N, L] 前 N 个 query
+    pos = all_elements[0, :, :2].cpu().numpy()           # [N, 2] x, y
+    cos_sin = all_elements[0, :, 2:4].cpu().numpy()      # [N, 2] cos, sin
+    mask = encoding_mask.view(B, N)[0].cpu().numpy()      # [N] True=invalid
+    map_start = n_agents
+    N_map = index_pair.shape[0] // B                     # 实际 map token 数
 
-    # 类型边界
+    # ---- m2m: [B*N_map, L] 局部索引 → [N_map, L] 全局索引 ----
+    ip = index_pair.reshape(B, N_map, -1)[0].cpu().numpy()  # [N_map, L] 局部
+    ip_global = ip.copy()
+    ip_global[ip >= 0] += map_start                         # 偏移到全局索引
+
+    # ---- 构建 m2m edge pairs (全局索引) ----
+    m2m_src, m2m_dst = [], []
+    for qi in range(N_map):
+        qi_global = qi + map_start
+        if mask[qi_global]:
+            continue
+        for ni in ip[qi]:
+            if ni < 0 or ni >= N_map or mask[ni + map_start]:
+                continue
+            m2m_src.append(qi_global)
+            m2m_dst.append(ni + map_start)
+    m2m_edges = np.stack([m2m_src, m2m_dst]) if m2m_src else np.empty((2, 0), dtype=np.int64)
+
+    # ---- 构建 a2m edge pairs (全局索引) ----
+    a2m_edges = np.empty((2, 0), dtype=np.int64)
+    if a2m_edge_index is not None and agent_nodes is not None and map_nodes is not None:
+        agent_b0 = agent_nodes[agent_nodes[:, 0] == 0].cpu().numpy()
+        map_b0 = map_nodes[map_nodes[:, 0] == 0].cpu().numpy()
+        a2m_ei = a2m_edge_index.cpu().numpy()
+        src_list_a2m, dst_list_a2m = [], []
+        for i in range(a2m_ei.shape[1]):
+            s, t = int(a2m_ei[0, i]), int(a2m_ei[1, i])
+            if s < len(map_b0) and t < len(agent_b0):
+                gs = int(map_b0[s, 1])     # map token 全局索引 (已含 map_start)
+                gt = int(agent_b0[t, 1])    # agent token 全局索引
+                if not mask[gs] and not mask[gt]:
+                    src_list_a2m.append(gs)
+                    dst_list_a2m.append(gt)
+        if src_list_a2m:
+            a2m_edges = np.stack([src_list_a2m, dst_list_a2m])
+
+    # ---- 类型信息 ----
     type_boundaries = [0, n_agents, n_agents + n_static,
                        n_agents + n_static + n_lanes,
                        n_agents + n_static + n_lanes + n_roadlines, N]
@@ -441,47 +497,57 @@ def debug_index_pair(index_pair, all_elements, encoding_mask, B, N, local_attn_k
         type_ids[type_boundaries[t]:type_boundaries[t + 1]] = t
 
     np.savez(os.path.join(save_dir, 'index_pair_debug.npz'),
-             pos=pos, cos_sin=cos_sin, mask=mask, index_pair=ip,
+             pos=pos, cos_sin=cos_sin, mask=mask,
+             index_pair=ip_global,   # [N_map, L] 全局索引
+             m2m_edges=m2m_edges,
+             a2m_edges=a2m_edges,
              type_ids=type_ids, type_names=type_names,
              local_attn_k=local_attn_k)
 
     # ---- 打印统计信息 ----
     print(f'[DEBUG index_pair] ========================================')
-    print(f'[DEBUG index_pair] N={N}, L={local_attn_k}, B={B}')
+    print(f'[DEBUG index_pair] N={N}, N_map={N_map}, L={local_attn_k}, B={B}')
     print(f'[DEBUG index_pair] data saved to {save_dir}/index_pair_debug.npz')
 
-    for t in range(len(type_boundaries) - 1):
-        start, end = type_boundaries[t], type_boundaries[t + 1]
-        valid_in_type = [i for i in range(start, end) if not mask[i]]
-        if not valid_in_type:
+    # m2m 统计：只统计 map 类型 token
+    for t_idx in range(1, len(type_boundaries) - 1):  # 跳过 agent (type 0)
+        start, end = type_boundaries[t_idx], type_boundaries[t_idx + 1]
+        local_start = max(start - map_start, 0)
+        local_end = min(end - map_start, N_map)
+        valid_locals = [i for i in range(local_start, local_end) if not mask[i + map_start]]
+        if not valid_locals:
             continue
 
-        # 统计该类型 token 的邻居有效性
         nbr_type_counts = np.zeros(len(type_names), dtype=np.int32)
-        total_valid_nbrs = 0
-        total_nbrs = 0
-        total_dist = 0.0
+        total_valid_nbrs = total_nbrs = total_dist = 0.0
         sample_count = 0
 
-        for qi in valid_in_type:
-            qx, qy = pos[qi]
-            for ni in ip[qi]:
+        for li in valid_locals:
+            gi = li + map_start
+            qx, qy = pos[gi]
+            for ni_local in ip[li]:
                 total_nbrs += 1
-                if ni < 0 or ni >= N or mask[ni]:
+                if ni_local < 0 or ni_local >= N_map or mask[ni_local + map_start]:
                     continue
                 total_valid_nbrs += 1
-                nbr_type_counts[type_ids[ni]] += 1
-                nx, ny = pos[ni]
+                ni_global = ni_local + map_start
+                nbr_type_counts[type_ids[ni_global]] += 1
+                nx, ny = pos[ni_global]
                 total_dist += np.sqrt((qx - nx)**2 + (qy - ny)**2)
                 sample_count += 1
 
         avg_dist = total_dist / sample_count if sample_count > 0 else 0.0
         valid_ratio = total_valid_nbrs / total_nbrs if total_nbrs > 0 else 0.0
-
-        print(f'[DEBUG index_pair] {type_names[t]:>14s}: {len(valid_in_type)} valid tokens, '
+        print(f'[DEBUG index_pair] m2m {type_names[t_idx]:>14s}: {len(valid_locals)} valid, '
               f'valid_nbr_ratio={valid_ratio:.2%}, avg_dist={avg_dist:.2f}')
         nbr_str = ', '.join(f'{type_names[j]}={nbr_type_counts[j]}' for j in range(len(type_names)))
         print(f'[DEBUG index_pair]   neighbor types: {nbr_str}')
+
+    # a2m 统计
+    if a2m_edges.shape[1] > 0:
+        n_agents_valid = len(set(a2m_edges[1]))
+        print(f'[DEBUG index_pair] a2m: {a2m_edges.shape[1]} edges, '
+              f'{n_agents_valid} agents connected')
 
     print(f'[DEBUG index_pair] ========================================')
 

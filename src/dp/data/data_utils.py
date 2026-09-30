@@ -2,11 +2,14 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
-# Global max limits for map elements (should match config values)
-_MAX_LANES = 256
-_MAX_ROADLINES = 128
-_MAX_STATIC_MAPS = 20
 _MAX_TRAFFIC_LIGHTS = 20
+
+_PACKED_MAP_KEYS = {
+    'map_geometry', 'map_type', 'map_light_type',
+    'map_stop_point', 'map_has_stop_point',
+    'map_speed_limit', 'map_has_speed_limit', 'map_parent_id',
+    'map_segment_index',
+}
 
 
 def _pad_or_truncate(tensor, target_size, pad_value=0.0):
@@ -25,7 +28,7 @@ def _pad_or_truncate(tensor, target_size, pad_value=0.0):
 def data_collate_fn(batch_list):
     """
     Collects a batch of data from a list of transitions.
-    Handles variable-length map elements by padding/truncating to fixed max sizes.
+    Concatenates variable-length map tokens and records their scenario indices.
 
     Args:
         batch_list (List): a list of transitions.
@@ -33,22 +36,6 @@ def data_collate_fn(batch_list):
     Returns:
         Dict[str, torch.Tensor]: a batch of data.
     """
-    # Keys that need per-batch padding/truncation
-    map_keys_2d = {
-        'traffic_light_points': _MAX_TRAFFIC_LIGHTS,
-        'lanes_valid': _MAX_LANES,
-        'lanes_speed_limit': _MAX_LANES,
-        'lanes_has_speed_limit': _MAX_LANES,
-        'lanes_stop_point': _MAX_LANES,
-        'roadlines_valid': _MAX_ROADLINES,
-        'static_maps_valid': _MAX_STATIC_MAPS,
-    }
-    map_keys_3d = {
-        'lanes': _MAX_LANES,
-        'roadlines': _MAX_ROADLINES,
-        'static_maps': _MAX_STATIC_MAPS,
-    }
-
     special_keys = {
         'scenario_id', 
         'tfrecord_path', 
@@ -57,14 +44,12 @@ def data_collate_fn(batch_list):
         'agents_id_remaining'
     }
 
-    # Apply pad/truncate to each sample's map elements
+    # Traffic lights are not map tokens and retain the existing bounded tensor.
     for sample in batch_list:
-        for key, max_size in map_keys_2d.items():
-            if key in sample:
-                sample[key] = _pad_or_truncate(sample[key], max_size)
-        for key, max_size in map_keys_3d.items():
-            if key in sample:
-                sample[key] = _pad_or_truncate(sample[key], max_size)
+        if 'traffic_light_points' in sample:
+            sample['traffic_light_points'] = _pad_or_truncate(
+                sample['traffic_light_points'], _MAX_TRAFFIC_LIGHTS
+            )
 
     key_to_list = {}
     for key in batch_list[0].keys():
@@ -72,9 +57,20 @@ def data_collate_fn(batch_list):
 
     input_batch = {}
     for key, value in key_to_list.items():
-        if key in special_keys:
+        if key in _PACKED_MAP_KEYS:
+            input_batch[key] = torch.cat(value, dim=0)
+        elif key in special_keys:
             input_batch[key] = value
         else:
             input_batch[key] = torch.stack(value, axis=0)
-    
+
+    counts = torch.tensor(
+        [sample['map_geometry'].shape[0] for sample in batch_list], dtype=torch.long
+    )
+    input_batch['map_batch'] = torch.repeat_interleave(
+        torch.arange(len(batch_list), dtype=torch.long), counts
+    )
+    input_batch['map_ptr'] = torch.cat([
+        torch.zeros(1, dtype=torch.long), counts.cumsum(dim=0)
+    ])
     return input_batch

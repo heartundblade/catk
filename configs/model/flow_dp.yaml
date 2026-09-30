@@ -1,0 +1,103 @@
+_target_: src.flow.flow_matching_planner.FlowMatchingPlanner
+
+# # Basic Settings
+
+# name: "flow-matching-planner-training"
+
+# save_dir: "."
+
+config:
+  # Data Settings
+  future_len: 80
+  time_len: 11
+  agent_state_dim: 9
+  agent_num: 64
+  lane_len: 30
+  lane_state_dim: 4
+  lane_num: 256
+  roadline_len: 30
+  roadline_state_dim: 3
+  roadline_num: 128
+  static_map_len: 10
+  static_map_state_dim: 3
+  static_map_num: 20
+  traffic_light_num: 20
+  train_predictor: false
+
+  # DataLoader Parameters
+  augment_prob: 0.5
+  normalization_file_path: ${paths.root_dir}/src/dp/normalization.json
+  use_data_augment: true
+  num_workers: 4
+  pin_mem: true
+
+  # Training Parameters
+  seed: 3407
+  train_epochs: 500
+  save_utd: 20
+  learning_rate: 5e-4
+  warm_up_epoch: 5
+  encoder_drop_path_rate: 0.1
+  decoder_drop_path_rate: 0.1
+  alpha_planning_loss: 1.0
+  device: "cuda"
+  use_ema: true
+
+  # Model Parameters
+  polyline_encoder_depth: 2
+  encoder_depth: 3
+  decoder_depth: 3
+  num_heads: 8
+  hidden_dim: 128
+  local_attn_k: 16
+  top_k_intention: 6
+  num_modes: 6
+  num_intention_points: 64
+  diffusion_model_type: "x_start"
+
+  # Encoder Parameters (encoder_smart.py: SMARTMapEncoder + Encoder)
+  pl2pl_radius_m: 10.0
+  max_map_neighbors: 20
+  num_map_layers: 3
+  map_segment_length_m: 5.0
+  map_segment_points: 3
+  a2a_attn_k: 32
+  pl2a_radius_m: 30.0
+  use_adaptive_edge_radius: false
+  adaptive_edge_base_radius_m: 10.0
+  adaptive_edge_time_horizon_s: 1.0
+  adaptive_edge_min_radius_m: 25.0
+  adaptive_edge_max_radius_m: 80.0
+
+  # Decoder Parameters
+  predicted_neighbor_num: 63
+  action_len: 2
+  rho_fixed: {1: 0.224, 3: 0.05}
+  num_chunks: 8
+  diffusion_steps: 10
+
+  # ═══════════════════════════════════════════════
+  # Flow Matching Parameters (新增)
+  # ═══════════════════════════════════════════════
+  flow_steps: 10           # ODE 积分步数
+  flow_solver: "heun"      # ODE 求解器: "euler" 或 "heun"
+  flow_noise_scale: 1.0    # 采样初始噪声缩放系数
+
+  # Guidance Function
+  guidance_fn: null
+
+  # Validation Parameters
+  step_len: 10
+  val_open_loop: true
+  val_closed_loop: false
+  fast_wosac_metric: false
+  n_rollout_closed_val: 32
+  log_epoch: -1
+  wosac_submission:
+    is_active: false
+    method_name: "FlowDP"
+    authors: [Anonymous]
+    affiliation: YOUR_AFFILIATION
+    description: "Flow matching planner"
+    method_link: YOUR_METHOD_LINK
+    account_name: YOUR_ACCOUNT_NAME
